@@ -29,7 +29,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
     // Total rebases performed
     uint256 public totalRebases;
     
-    // Events
+    
     event Rebase(uint256 indexed epoch, uint256 totalSupply, uint256 newPrice);
     event PriceUpdate(uint256 newPrice, uint256 timestamp);
     event Mint(address indexed to, uint256 amount);
@@ -41,10 +41,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
         _mint(msg.sender, 1000000 * 10**decimals()); // Initial supply: 1M tokens
     }
     
-    /**
-     * @dev Core Function 1: Rebase the token supply based on current price
-     * Adjusts total supply to maintain price stability
-     */
+  
     function rebase() external nonReentrant returns (uint256) {
         require(
             block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL,
