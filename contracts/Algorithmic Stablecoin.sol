@@ -5,11 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-/**
- * @title AlgorithmicStablecoin
- * @dev An algorithmic stablecoin that maintains price stability through supply adjustments
- * Target price: $1.00 USD
- */
+
 contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
     
     // Price target in wei (1 USD = 1e18)
