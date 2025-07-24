@@ -11,22 +11,17 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
     // Price target in wei (1 USD = 1e18)
     uint256 public constant TARGET_PRICE = 1e18;
     
-    // Price tolerance (5% = 5e16)
+
     uint256 public constant PRICE_TOLERANCE = 5e16;
-    
-    // Rebase rate (1% = 1e16)
+  
     uint256 public constant REBASE_RATE = 1e16;
-    
-    // Minimum time between rebases (1 hour)
+
     uint256 public constant MIN_REBASE_INTERVAL = 3600;
-    
-    // Current market price (simulated oracle)
+
     uint256 public currentPrice;
-    
-    // Last rebase timestamp
+
     uint256 public lastRebaseTime;
     
-    // Total rebases performed
     uint256 public totalRebases;
     
     
@@ -50,7 +45,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
         
         uint256 priceDelta = _calculatePriceDelta();
         
-        // Only rebase if price is outside tolerance
+  
         if (priceDelta <= PRICE_TOLERANCE) {
             return totalSupply();
         }
@@ -58,12 +53,12 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
         uint256 newSupply;
         
         if (currentPrice > TARGET_PRICE + PRICE_TOLERANCE) {
-            // Price too high, increase supply (inflationary rebase)
+
             uint256 supplyIncrease = (totalSupply() * REBASE_RATE) / 1e18;
             newSupply = totalSupply() + supplyIncrease;
             _mint(address(this), supplyIncrease);
         } else if (currentPrice < TARGET_PRICE - PRICE_TOLERANCE) {
-            // Price too low, decrease supply (deflationary rebase)
+     
             uint256 supplyDecrease = (totalSupply() * REBASE_RATE) / 1e18;
             newSupply = totalSupply() - supplyDecrease;
             _burn(address(this), supplyDecrease);
