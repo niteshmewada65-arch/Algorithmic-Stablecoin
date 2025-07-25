@@ -1,142 +1,112 @@
-// SPDX-License-Identifier: 
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
-
-contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
+contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     
-    // Price target in wei (1 USD = 1e18)
     uint256 public constant TARGET_PRICE = 1e18;
-    
-
-    uint256 public constant PRICE_TOLERANCE = 5e16;
-  
-    uint256 public constant REBASE_RATE = 1e16;
-
-    uint256 public constant MIN_REBASE_INTERVAL = 3600;
+    uint256 public PRICE_TOLERANCE = 5e16;
+    uint256 public REBASE_RATE = 1e16;
+    uint256 public MIN_REBASE_INTERVAL = 3600;
 
     uint256 public currentPrice;
-
     uint256 public lastRebaseTime;
-    
     uint256 public totalRebases;
-    
-    
+
+    mapping(address => bool) public blacklisted;
+
+    uint256[] public priceHistory;
+    uint8 public constant MAX_HISTORY = 10;
+
     event Rebase(uint256 indexed epoch, uint256 totalSupply, uint256 newPrice);
     event PriceUpdate(uint256 newPrice, uint256 timestamp);
     event Mint(address indexed to, uint256 amount);
     event Burn(address indexed from, uint256 amount);
-    
-    constructor() ERC20("Algorithmic Stablecoin", "ASTC") Ownable(msg.sender) {
-        currentPrice = TARGET_PRICE; // Start at $1.00
-        lastRebaseTime = block.timestamp;
-        _mint(msg.sender, 1000000 * 10**decimals()); // Initial supply: 1M tokens
+    event Blacklisted(address indexed user, bool status);
+    event RebaseParamsUpdated(uint256 newRate, uint256 newTolerance);
+    event ManualRebase(uint256 newSupply, uint256 newPrice);
+
+    modifier notBlacklisted(address user) {
+        require(!blacklisted[user], "Address is blacklisted");
+        _;
     }
-    
-  
-    function rebase() external nonReentrant returns (uint256) {
-        require(
-            block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL,
-            "Rebase: Too soon since last rebase"
-        );
-        
+
+    constructor() ERC20("Algorithmic Stablecoin", "ASTC") Ownable(msg.sender) {
+        currentPrice = TARGET_PRICE;
+        lastRebaseTime = block.timestamp;
+        _mint(msg.sender, 1_000_000 * 10**decimals());
+    }
+
+    function rebase() external whenNotPaused nonReentrant returns (uint256) {
+        require(block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL, "Too soon since last rebase");
+
         uint256 priceDelta = _calculatePriceDelta();
-        
-  
+
         if (priceDelta <= PRICE_TOLERANCE) {
             return totalSupply();
         }
-        
-        uint256 newSupply;
-        
-        if (currentPrice > TARGET_PRICE + PRICE_TOLERANCE) {
 
+        uint256 newSupply;
+        if (currentPrice > TARGET_PRICE + PRICE_TOLERANCE) {
             uint256 supplyIncrease = (totalSupply() * REBASE_RATE) / 1e18;
             newSupply = totalSupply() + supplyIncrease;
             _mint(address(this), supplyIncrease);
-        } else if (currentPrice < TARGET_PRICE - PRICE_TOLERANCE) {
-     
+        } else {
             uint256 supplyDecrease = (totalSupply() * REBASE_RATE) / 1e18;
             newSupply = totalSupply() - supplyDecrease;
             _burn(address(this), supplyDecrease);
-        } else {
-            return totalSupply();
         }
-        
+
         lastRebaseTime = block.timestamp;
         totalRebases++;
-        
         emit Rebase(totalRebases, newSupply, currentPrice);
-        
         return newSupply;
     }
-    
-    /**
-     * @dev Core Function 2: Update the current market price
-     * In production, this would be called by a price oracle
-     */
+
     function updatePrice(uint256 _newPrice) external onlyOwner {
-        require(_newPrice > 0, "Price must be greater than 0");
-        
+        require(_newPrice > 0, "Invalid price");
         currentPrice = _newPrice;
-        
+
+        // Store in history
+        if (priceHistory.length >= MAX_HISTORY) {
+            for (uint i = 0; i < MAX_HISTORY - 1; i++) {
+                priceHistory[i] = priceHistory[i + 1];
+            }
+            priceHistory[MAX_HISTORY - 1] = _newPrice;
+        } else {
+            priceHistory.push(_newPrice);
+        }
+
         emit PriceUpdate(_newPrice, block.timestamp);
     }
-    
-    /**
-     * @dev Core Function 3: Mint new tokens (controlled minting for liquidity)
-     * Only owner can mint to prevent inflation attacks
-     */
-    function mint(address _to, uint256 _amount) external onlyOwner {
-        require(_to != address(0), "Cannot mint to zero address");
-        require(_amount > 0, "Amount must be greater than 0");
-        
+
+    function mint(address _to, uint256 _amount) external onlyOwner notBlacklisted(_to) {
+        require(_to != address(0) && _amount > 0, "Invalid mint");
         _mint(_to, _amount);
-        
         emit Mint(_to, _amount);
     }
-    
-    /**
-     * @dev Burn tokens from caller's balance
-     */
-    function burn(uint256 _amount) external {
-        require(_amount > 0, "Amount must be greater than 0");
-        require(balanceOf(msg.sender) >= _amount, "Insufficient balance");
-        
+
+    function burn(uint256 _amount) external notBlacklisted(msg.sender) {
+        require(_amount > 0 && balanceOf(msg.sender) >= _amount, "Invalid burn");
         _burn(msg.sender, _amount);
-        
         emit Burn(msg.sender, _amount);
     }
-    
-    /**
-     * @dev Calculate the absolute difference between current and target price
-     */
+
     function _calculatePriceDelta() internal view returns (uint256) {
-        if (currentPrice >= TARGET_PRICE) {
-            return currentPrice - TARGET_PRICE;
-        } else {
-            return TARGET_PRICE - currentPrice;
-        }
+        return currentPrice > TARGET_PRICE 
+            ? currentPrice - TARGET_PRICE 
+            : TARGET_PRICE - currentPrice;
     }
-    
-    /**
-     * @dev Check if rebase is needed
-     */
+
     function isRebaseNeeded() external view returns (bool) {
-        if (block.timestamp < lastRebaseTime + MIN_REBASE_INTERVAL) {
-            return false;
-        }
-        
-        uint256 priceDelta = _calculatePriceDelta();
-        return priceDelta > PRICE_TOLERANCE;
+        if (block.timestamp < lastRebaseTime + MIN_REBASE_INTERVAL) return false;
+        return _calculatePriceDelta() > PRICE_TOLERANCE;
     }
-    
-    /**
-     * @dev Get contract information
-     */
+
     function getContractInfo() external view returns (
         uint256 _currentPrice,
         uint256 _targetPrice,
@@ -145,33 +115,59 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard {
         uint256 _totalRebases,
         bool _rebaseNeeded
     ) {
-        uint256 priceDelta = _calculatePriceDelta();
-        bool rebaseNeeded = (block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL) && 
-                           (priceDelta > PRICE_TOLERANCE);
-        
         return (
             currentPrice,
             TARGET_PRICE,
             totalSupply(),
             lastRebaseTime,
             totalRebases,
-            rebaseNeeded
+            (block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL) && 
+            (_calculatePriceDelta() > PRICE_TOLERANCE)
         );
     }
-    
-    /**
-     * @dev Emergency function to withdraw any ETH sent to contract
-     */
+
+    function getPriceHistory() external view returns (uint256[] memory) {
+        return priceHistory;
+    }
+
+    function updateRebaseParams(uint256 _newRate, uint256 _newTolerance) external onlyOwner {
+        require(_newRate <= 1e18 && _newTolerance <= 1e18, "Invalid parameters");
+        REBASE_RATE = _newRate;
+        PRICE_TOLERANCE = _newTolerance;
+        emit RebaseParamsUpdated(_newRate, _newTolerance);
+    }
+
+    function setBlacklist(address user, bool value) external onlyOwner {
+        blacklisted[user] = value;
+        emit Blacklisted(user, value);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function manualRebase(bool increase) external onlyOwner whenNotPaused {
+        uint256 amount = (totalSupply() * REBASE_RATE) / 1e18;
+        if (increase) {
+            _mint(address(this), amount);
+        } else {
+            _burn(address(this), amount);
+        }
+        totalRebases++;
+        lastRebaseTime = block.timestamp;
+        emit ManualRebase(totalSupply(), currentPrice);
+    }
+
     function withdrawETH() external onlyOwner {
         uint256 balance = address(this).balance;
         require(balance > 0, "No ETH to withdraw");
-        
         (bool success, ) = payable(owner()).call{value: balance}("");
         require(success, "ETH withdrawal failed");
     }
-    
-    /**
-     * @dev Allow contract to receive ETH
-     */
+
     receive() external payable {}
 }
