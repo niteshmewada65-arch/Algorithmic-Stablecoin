@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: 
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
 contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
-    
+
     uint256 public constant TARGET_PRICE = 1e18;
     uint256 public PRICE_TOLERANCE = 5e16;
     uint256 public REBASE_RATE = 1e16;
@@ -18,9 +18,17 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     uint256 public totalRebases;
 
     mapping(address => bool) public blacklisted;
+    mapping(address => bool) public hasVoted;
+    uint256 public voteCount;
+    uint256 public newProposedRate;
 
     uint256[] public priceHistory;
     uint8 public constant MAX_HISTORY = 10;
+
+    address public treasury;
+    uint256 public transactionFee = 2; // 2%
+
+    bool public transfersFrozen = false;
 
     event Rebase(uint256 indexed epoch, uint256 totalSupply, uint256 newPrice);
     event PriceUpdate(uint256 newPrice, uint256 timestamp);
@@ -29,9 +37,18 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     event Blacklisted(address indexed user, bool status);
     event RebaseParamsUpdated(uint256 newRate, uint256 newTolerance);
     event ManualRebase(uint256 newSupply, uint256 newPrice);
+    event TreasuryUpdated(address indexed newTreasury);
+    event TokenRecovered(address indexed token, uint256 amount);
+    event VoteCast(address indexed voter, uint256 proposedRate);
+    event TransfersFrozen(bool status);
 
     modifier notBlacklisted(address user) {
         require(!blacklisted[user], "Address is blacklisted");
+        _;
+    }
+
+    modifier notFrozen() {
+        require(!transfersFrozen, "Token transfers are frozen");
         _;
     }
 
@@ -39,6 +56,16 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         currentPrice = TARGET_PRICE;
         lastRebaseTime = block.timestamp;
         _mint(msg.sender, 1_000_000 * 10**decimals());
+        treasury = msg.sender;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override notBlacklisted(from) notBlacklisted(to) notFrozen {
+        if (treasury != address(0) && transactionFee > 0 && from != owner() && to != owner()) {
+            uint256 fee = (amount * transactionFee) / 100;
+            super._transfer(from, treasury, fee);
+            amount -= fee;
+        }
+        super._transfer(from, to, amount);
     }
 
     function rebase() external whenNotPaused nonReentrant returns (uint256) {
@@ -71,7 +98,6 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         require(_newPrice > 0, "Invalid price");
         currentPrice = _newPrice;
 
-        // Store in history
         if (priceHistory.length >= MAX_HISTORY) {
             for (uint i = 0; i < MAX_HISTORY - 1; i++) {
                 priceHistory[i] = priceHistory[i + 1];
@@ -167,6 +193,49 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         require(balance > 0, "No ETH to withdraw");
         (bool success, ) = payable(owner()).call{value: balance}("");
         require(success, "ETH withdrawal failed");
+    }
+
+    // ============ NEW FEATURES ============
+
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "Invalid treasury");
+        treasury = _treasury;
+        emit TreasuryUpdated(_treasury);
+    }
+
+    function setTransactionFee(uint256 feePercent) external onlyOwner {
+        require(feePercent <= 10, "Fee too high");
+        transactionFee = feePercent;
+    }
+
+    function recoverTokens(address tokenAddress, uint256 amount) external onlyOwner {
+        require(tokenAddress != address(this), "Can't recover ASTC");
+        IERC20(tokenAddress).transfer(owner(), amount);
+        emit TokenRecovered(tokenAddress, amount);
+    }
+
+    function voteNewRebaseRate(uint256 proposedRate) external {
+        require(!hasVoted[msg.sender], "Already voted");
+        require(proposedRate <= 1e18, "Too high");
+        newProposedRate += proposedRate;
+        voteCount++;
+        hasVoted[msg.sender] = true;
+        emit VoteCast(msg.sender, proposedRate);
+    }
+
+    function finalizeRebaseVote() external onlyOwner {
+        require(voteCount > 0, "No votes");
+        REBASE_RATE = newProposedRate / voteCount;
+        newProposedRate = 0;
+        voteCount = 0;
+
+        // Reset voter flags (for demo: expensive on chain, better off-chain)
+        // This is simplified for this example.
+    }
+
+    function freezeTransfers(bool status) external onlyOwner {
+        transfersFrozen = status;
+        emit TransfersFrozen(status);
     }
 
     receive() external payable {}
