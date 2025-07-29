@@ -44,7 +44,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     bool public transfersFrozen = false;
     bool public rebasePaused = false;
 
-    // NEW FUNCTIONALITIES START HERE
+
 
     // 1. Staking Mechanism
     struct StakeInfo {
@@ -146,7 +146,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     event BridgeTransfer(address indexed from, address indexed to, uint256 amount, uint256 targetChain);
     event AMMRebalance(uint256 oldPrice, uint256 newPrice);
 
-    // Existing modifiers and events remain the same...
+ 
     event Rebase(uint256 indexed epoch, uint256 totalSupply, uint256 newPrice);
     event PriceUpdate(uint256 newPrice, uint256 timestamp);
     event Mint(address indexed to, uint256 amount);
@@ -215,7 +215,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         bridgeOperator = msg.sender;
     }
 
-    // EXISTING FUNCTIONS (keeping all original functionality)
+
     
     function _transfer(address from, address to, uint256 amount) internal override notBlacklisted(from) notBlacklisted(to) notFrozen circuitBreakerCheck {
         // Update monthly volume for dynamic fees
@@ -228,7 +228,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
             super._transfer(from, treasury, fee);
             amount -= fee;
             
-            // LP rewards
+         
             if (liquidityProviders[from] || liquidityProviders[to]) {
                 uint256 lpBonus = (fee * lpRewardRate) / 1e18;
                 lpRewards[liquidityProviders[from] ? from : to] += lpBonus;
@@ -241,7 +241,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         require(!rebasePaused, "Rebase paused");
         require(block.timestamp >= lastRebaseTime + MIN_REBASE_INTERVAL, "Wait for interval");
 
-        // Use oracle price if available
+       
         if (useOracles && oracleAddresses.length > 0) {
             _updatePriceFromOracles();
         }
