@@ -60,7 +60,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     uint256 public stakingPool;
     uint256 public minStakingPeriod = 7 days;
     
-    // 2. Price Oracle Integration
+
     struct PriceOracle {
         address oracle;
         uint256 weight;
@@ -71,8 +71,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     address[] public oracleAddresses;
     uint256 public totalOracleWeight;
     bool public useOracles = false;
-    
-    // 3. Dynamic Fee Structure
+   
     struct FeeConfig {
         uint256 baseFee;
         uint256 volumeFeeThreshold;
@@ -90,7 +89,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     mapping(address => uint256) public monthlyVolume;
     mapping(address => uint256) public lastVolumeReset;
     
-    // 4. Governance Token Integration
+
     address public governanceToken;
     uint256 public proposalThreshold = 1000 * 1e18; // Min governance tokens to create proposal
     uint256 public votingPeriod = 3 days;
@@ -110,28 +109,27 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
     mapping(uint256 => Proposal) public proposals;
     uint256 public proposalCount;
     
-    // 5. Liquidity Incentives
     mapping(address => bool) public liquidityProviders;
     mapping(address => uint256) public lpRewards;
     uint256 public lpRewardRate = 3e16; // 3% bonus
     
-    // 6. Emergency Circuit Breaker
+ 
     uint256 public maxPriceDeviation = 2e17; // 20%
     bool public circuitBreakerActive = false;
     uint256 public circuitBreakerCooldown = 1 hours;
     uint256 public lastCircuitBreakerTime;
     
-    // 7. Cross-chain Bridge Support
+
     mapping(uint256 => bool) public supportedChains;
     mapping(bytes32 => bool) public processedBridgeTransactions;
     address public bridgeOperator;
     
-    // 8. Automated Market Maker Integration
+  
     address public ammPair;
     uint256 public ammRebalanceThreshold = 1e17; // 10%
     bool public autoRebalanceEnabled = true;
 
-    // NEW EVENTS
+
     event Staked(address indexed user, uint256 amount);
     event Unstaked(address indexed user, uint256 amount, uint256 rewards);
     event StakingRewardsClaimed(address indexed user, uint256 amount);
@@ -218,7 +216,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
 
     
     function _transfer(address from, address to, uint256 amount) internal override notBlacklisted(from) notBlacklisted(to) notFrozen circuitBreakerCheck {
-        // Update monthly volume for dynamic fees
+       
         _updateMonthlyVolume(from, amount);
         
         uint256 dynamicFee = _calculateDynamicFee(from, amount);
@@ -254,8 +252,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
             uint256 inc = (totalSupply() * REBASE_RATE) / 1e18;
             newSupply = totalSupply() + inc;
             _mint(address(this), inc);
-            
-            // Add to staking pool
+      
             stakingPool += inc / 10; // 10% goes to staking rewards
         } else {
             uint256 dec = (totalSupply() * REBASE_RATE) / 1e18;
@@ -266,7 +263,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         lastRebaseTime = block.timestamp;
         totalRebases++;
         
-        // Trigger AMM rebalance if needed
+     
         if (autoRebalanceEnabled && ammPair != address(0)) {
             _triggerAMMRebalance();
         }
@@ -275,7 +272,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         return newSupply;
     }
 
-    // NEW FUNCTIONS START HERE
+  
 
     // 1. STAKING FUNCTIONS
     function stake(uint256 amount) external notBlacklisted(msg.sender) {
@@ -330,7 +327,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         return rewards;
     }
     
-    // 2. ORACLE FUNCTIONS
+
     function addOracle(address oracle, uint256 weight) external onlyOwner {
         require(oracle != address(0), "Invalid oracle");
         require(!priceOracles[oracle].isActive, "Oracle already exists");
@@ -383,7 +380,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         }
     }
     
-    // 3. DYNAMIC FEE FUNCTIONS
+
     function _updateMonthlyVolume(address user, uint256 amount) internal {
         if (block.timestamp > lastVolumeReset[user] + 30 days) {
             monthlyVolume[user] = 0;
@@ -401,7 +398,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         return feeConfig.baseFee;
     }
     
-    // 4. GOVERNANCE FUNCTIONS
+
     function createProposal(string memory description) external returns (uint256) {
         require(governanceToken != address(0), "No governance token set");
         require(IERC20(governanceToken).balanceOf(msg.sender) >= proposalThreshold, "Insufficient governance tokens");
@@ -438,8 +435,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         
         emit VoteCasted(proposalId, msg.sender, support);
     }
-    
-    // 5. LIQUIDITY PROVIDER FUNCTIONS
+
     function addLiquidityProvider(address provider) external onlyOwner {
         liquidityProviders[provider] = true;
         emit LiquidityProviderAdded(provider);
@@ -453,7 +449,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         _mint(msg.sender, rewards);
     }
     
-    // 6. BRIDGE FUNCTIONS
+
     function bridgeTransfer(address to, uint256 amount, uint256 targetChain) external {
         require(supportedChains[targetChain], "Unsupported chain");
         require(balanceOf(msg.sender) >= amount, "Insufficient balance");
@@ -470,7 +466,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         _mint(to, amount);
     }
     
-    // 7. AMM INTEGRATION
+
     function _triggerAMMRebalance() internal {
         if (ammPair == address(0)) return;
         
@@ -481,7 +477,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         }
     }
     
-    // ADMIN FUNCTIONS FOR NEW FEATURES
+
     function setStakingRewardRate(uint256 newRate) external onlyOwner {
         require(newRate <= 2e17, "Rate too high"); // Max 20%
         stakingRewardRate = newRate;
@@ -511,7 +507,7 @@ contract AlgorithmicStablecoin is ERC20, Ownable, ReentrancyGuard, Pausable {
         circuitBreakerActive = false;
     }
 
-    // Keep all existing functions...
+
     function updatePrice(uint256 _newPrice) external onlyOwner {
         require(_newPrice > 0, "Invalid price");
         currentPrice = _newPrice;
