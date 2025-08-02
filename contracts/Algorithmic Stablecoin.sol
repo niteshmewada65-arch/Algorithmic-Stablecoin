@@ -11,6 +11,10 @@ interface IOracle {
     function getPrice() external view returns (uint256);
 }
 
+interface IFlashLoanReceiver {
+    function executeOperation(uint256 amount, uint256 fee, bytes calldata data) external;
+}
+
 contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -51,6 +55,9 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     // KYC
     mapping(address => bool) public isKYCed;
 
+    // Flash Loan
+    uint256 public flashLoanFeeBps = 5; // 0.05% fee (in basis points)
+
     // Events
     event Rebased(uint256 supplyDelta);
     event Staked(address indexed user, uint256 amount);
@@ -60,6 +67,7 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event KYCApproved(address indexed user);
     event CircuitBreakerTriggered(bool status);
     event FeesUpdated(uint256 burnPercent, uint256 devPercent);
+    event FlashLoan(address indexed receiver, uint256 amount, uint256 fee);
 
     modifier onlyKYCed() {
         require(isKYCed[msg.sender], "Not KYCed");
@@ -167,6 +175,27 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     function toggleCircuitBreaker(bool state) external onlyRole(GOVERNANCE_ROLE) {
         circuitBreaker = state;
         emit CircuitBreakerTriggered(state);
+    }
+
+    // --- Flash Loan ---
+    function flashLoan(address receiver, uint256 amount, bytes calldata data) external nonReentrant notPaused {
+        require(receiver != address(0), "Invalid receiver");
+        require(amount > 0 && amount <= balanceOf(address(this)), "Invalid loan amount");
+
+        uint256 fee = (amount * flashLoanFeeBps) / 10_000;
+        uint256 repayment = amount + fee;
+
+        _transfer(address(this), receiver, amount);
+        IFlashLoanReceiver(receiver).executeOperation(amount, fee, data);
+        require(balanceOf(address(this)) >= repayment, "Flash loan not repaid");
+
+        _transfer(receiver, address(this), repayment); // repaying the flash loan
+        emit FlashLoan(receiver, amount, fee);
+    }
+
+    function setFlashLoanFee(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
+        require(bps <= 100, "Fee too high"); // Max 1%
+        flashLoanFeeBps = bps;
     }
 
     // --- Admin Config ---
