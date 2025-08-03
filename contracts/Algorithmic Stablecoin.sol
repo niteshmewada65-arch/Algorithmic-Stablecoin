@@ -26,8 +26,8 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     uint256 public lastRebase;
     uint256 public rebaseCooldown = 1 days;
     IOracle public oracle;
-    uint256 public targetPrice = 1e18; // $1.00
-    uint256 public rebaseThreshold = 0.05e18; // 5%
+    uint256 public targetPrice = 1e18;
+    uint256 public rebaseThreshold = 0.05e18;
 
     // Staking
     struct StakeInfo {
@@ -35,11 +35,10 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         uint256 rewardDebt;
         uint256 lastClaimed;
     }
-
     mapping(address => StakeInfo) public stakes;
     uint256 public accRewardPerToken;
     uint256 public lastRewardTime;
-    uint256 public rewardRate = 1e16; // 0.01 ASTC per second
+    uint256 public rewardRate = 1e16;
 
     // Circuit Breaker
     bool public circuitBreaker;
@@ -48,15 +47,27 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     mapping(address => bool) public bridgeApproved;
 
     // Fees
-    uint256 public burnPercent = 1; // 1%
-    uint256 public devPercent = 1;  // 1%
+    uint256 public burnPercent = 1;
+    uint256 public devPercent = 1;
     address public devFund;
 
     // KYC
     mapping(address => bool) public isKYCed;
 
     // Flash Loan
-    uint256 public flashLoanFeeBps = 5; // 0.05% fee (in basis points)
+    uint256 public flashLoanFeeBps = 5;
+
+    // Governance Proposal Voting
+    struct Proposal {
+        string description;
+        uint256 voteCount;
+        uint256 createdAt;
+        bool executed;
+    }
+    uint256 public constant VOTE_DURATION = 3 days;
+    mapping(uint256 => Proposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    uint256 public proposalCount;
 
     // Events
     event Rebased(uint256 supplyDelta);
@@ -68,6 +79,9 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event CircuitBreakerTriggered(bool status);
     event FeesUpdated(uint256 burnPercent, uint256 devPercent);
     event FlashLoan(address indexed receiver, uint256 amount, uint256 fee);
+    event ProposalCreated(uint256 indexed id, string description);
+    event Voted(uint256 indexed id, address voter);
+    event ProposalExecuted(uint256 indexed id);
 
     modifier onlyKYCed() {
         require(isKYCed[msg.sender], "Not KYCed");
@@ -96,13 +110,11 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     // --- Rebase ---
     function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused {
         require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-
         uint256 price = oracle.getPrice();
         uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
         require(deviation >= int256(rebaseThreshold), "No significant deviation");
 
         uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
-
         if (price > targetPrice) {
             _mint(address(this), supplyDelta);
         } else {
@@ -117,20 +129,16 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     function stake(uint256 amount) external onlyKYCed notPaused nonReentrant {
         require(amount > 0, "Invalid amount");
         _updateRewards(msg.sender);
-
         _transfer(msg.sender, address(this), amount);
         stakes[msg.sender].amount += amount;
-
         emit Staked(msg.sender, amount);
     }
 
     function unstake(uint256 amount) external onlyKYCed notPaused nonReentrant {
         require(amount > 0 && stakes[msg.sender].amount >= amount, "Insufficient stake");
         _updateRewards(msg.sender);
-
         stakes[msg.sender].amount -= amount;
         _transfer(address(this), msg.sender, amount);
-
         emit Unstaked(msg.sender, amount);
     }
 
@@ -150,7 +158,6 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
             accRewardPerToken += (reward * 1e18) / totalStaked();
             lastRewardTime = block.timestamp;
         }
-
         uint256 userReward = ((stakes[user].amount * accRewardPerToken) / 1e18) - stakes[user].rewardDebt;
         stakes[user].rewardDebt += userReward;
         stakes[user].lastClaimed = block.timestamp;
@@ -181,20 +188,17 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     function flashLoan(address receiver, uint256 amount, bytes calldata data) external nonReentrant notPaused {
         require(receiver != address(0), "Invalid receiver");
         require(amount > 0 && amount <= balanceOf(address(this)), "Invalid loan amount");
-
         uint256 fee = (amount * flashLoanFeeBps) / 10_000;
         uint256 repayment = amount + fee;
-
         _transfer(address(this), receiver, amount);
         IFlashLoanReceiver(receiver).executeOperation(amount, fee, data);
         require(balanceOf(address(this)) >= repayment, "Flash loan not repaid");
-
-        _transfer(receiver, address(this), repayment); // repaying the flash loan
+        _transfer(receiver, address(this), repayment);
         emit FlashLoan(receiver, amount, fee);
     }
 
     function setFlashLoanFee(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
-        require(bps <= 100, "Fee too high"); // Max 1%
+        require(bps <= 100, "Fee too high");
         flashLoanFeeBps = bps;
     }
 
@@ -218,7 +222,39 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         devFund = _devFund;
     }
 
-    // --- ERC20 Overrides with Fees ---
+    // --- Governance Proposal Voting ---
+    function createProposal(string memory description) external onlyRole(GOVERNANCE_ROLE) {
+        proposals[proposalCount] = Proposal({
+            description: description,
+            voteCount: 0,
+            createdAt: block.timestamp,
+            executed: false
+        });
+        emit ProposalCreated(proposalCount, description);
+        proposalCount++;
+    }
+
+    function voteProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
+        require(id < proposalCount, "Invalid proposal");
+        Proposal storage p = proposals[id];
+        require(!hasVoted[id][msg.sender], "Already voted");
+        require(!p.executed, "Already executed");
+        p.voteCount++;
+        hasVoted[id][msg.sender] = true;
+        emit Voted(id, msg.sender);
+    }
+
+    function executeProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
+        require(id < proposalCount, "Invalid proposal");
+        Proposal storage p = proposals[id];
+        require(!p.executed, "Already executed");
+        require(block.timestamp <= p.createdAt + VOTE_DURATION, "Voting expired");
+        require(p.voteCount >= 2, "Not enough votes");
+        p.executed = true;
+        emit ProposalExecuted(id);
+    }
+
+    // --- ERC20 Override ---
     function _transfer(address from, address to, uint256 amount) internal override {
         if (from == address(this) || to == address(this) || hasRole(GOVERNANCE_ROLE, from)) {
             super._transfer(from, to, amount);
@@ -226,17 +262,17 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
             uint256 burnAmount = (amount * burnPercent) / 100;
             uint256 devAmount = (amount * devPercent) / 100;
             uint256 finalAmount = amount - burnAmount - devAmount;
-
             super._transfer(from, address(0), burnAmount);
             super._transfer(from, devFund, devAmount);
             super._transfer(from, to, finalAmount);
         }
     }
 
-    // --- Recover Stuck Tokens ---
+    // --- Recover Tokens ---
     function recoverTokens(address token) external onlyRole(GOVERNANCE_ROLE) {
         require(token != address(this), "Can't recover ASTC");
         uint256 bal = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransfer(msg.sender, bal);
     }
 }
+
