@@ -22,14 +22,14 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant KYC_PROVIDER_ROLE = keccak256("KYC_PROVIDER_ROLE");
 
-    // Supply Mechanics
+  
     uint256 public lastRebase;
     uint256 public rebaseCooldown = 1 days;
     IOracle public oracle;
     uint256 public targetPrice = 1e18;
     uint256 public rebaseThreshold = 0.05e18;
 
-    // Staking
+
     struct StakeInfo {
         uint256 amount;
         uint256 rewardDebt;
@@ -275,4 +275,5 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         IERC20(token).safeTransfer(msg.sender, bal);
     }
 }
+
 
