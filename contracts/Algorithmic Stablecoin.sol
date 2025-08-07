@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: 
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -275,5 +275,6 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         IERC20(token).safeTransfer(msg.sender, bal);
     }
 }
+
 
 
