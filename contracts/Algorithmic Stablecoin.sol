@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: 
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -22,14 +22,18 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant KYC_PROVIDER_ROLE = keccak256("KYC_PROVIDER_ROLE");
 
-  
+    // Rebase
     uint256 public lastRebase;
     uint256 public rebaseCooldown = 1 days;
     IOracle public oracle;
-    uint256 public targetPrice = 1e18;
-    uint256 public rebaseThreshold = 0.05e18;
+    uint256 public targetPrice = 1e18; // 1.0
+    uint256 public rebaseThreshold = 0.05e18; // 5%
 
+    // Manual oracle override
+    bool public useManualOracle;
+    uint256 public manualPrice;
 
+    // Staking
     struct StakeInfo {
         uint256 amount;
         uint256 rewardDebt;
@@ -51,6 +55,9 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     uint256 public devPercent = 1;
     address public devFund;
 
+    // Treasury
+    address public treasury;
+
     // KYC
     mapping(address => bool) public isKYCed;
 
@@ -63,11 +70,15 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         uint256 voteCount;
         uint256 createdAt;
         bool executed;
+        address execTarget;
+        uint256 execValue;
+        bytes execData;
     }
     uint256 public constant VOTE_DURATION = 3 days;
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
     uint256 public proposalCount;
+    uint256 public proposalQuorum = 2; // default votes required
 
     // Events
     event Rebased(uint256 supplyDelta);
@@ -76,12 +87,18 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event Unstaked(address indexed user, uint256 amount);
     event BridgeTransfer(address indexed user, uint256 amount, string targetChain);
     event KYCApproved(address indexed user);
+    event KYCRevoked(address indexed user);
     event CircuitBreakerTriggered(bool status);
     event FeesUpdated(uint256 burnPercent, uint256 devPercent);
     event FlashLoan(address indexed receiver, uint256 amount, uint256 fee);
     event ProposalCreated(uint256 indexed id, string description);
     event Voted(uint256 indexed id, address voter);
     event ProposalExecuted(uint256 indexed id);
+    event TreasuryUpdated(address indexed treasury);
+    event Slashed(address indexed user, uint256 amount);
+    event ManualOracleSet(uint256 price, bool enabled);
+    event TargetPriceUpdated(uint256 price);
+    event RebaseThresholdUpdated(uint256 threshold);
 
     modifier onlyKYCed() {
         require(isKYCed[msg.sender], "Not KYCed");
@@ -98,6 +115,7 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         _grantRole(GOVERNANCE_ROLE, msg.sender);
         oracle = IOracle(_oracle);
         devFund = _devFund;
+        treasury = _devFund;
         lastRewardTime = block.timestamp;
     }
 
@@ -107,10 +125,15 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         emit KYCApproved(user);
     }
 
+    function revokeKYC(address user) external onlyRole(KYC_PROVIDER_ROLE) {
+        isKYCed[user] = false;
+        emit KYCRevoked(user);
+    }
+
     // --- Rebase ---
     function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused {
         require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-        uint256 price = oracle.getPrice();
+        uint256 price = _getPrice();
         uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
         require(deviation >= int256(rebaseThreshold), "No significant deviation");
 
@@ -118,7 +141,39 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         if (price > targetPrice) {
             _mint(address(this), supplyDelta);
         } else {
-            _burn(address(this), Math.min(supplyDelta, balanceOf(address(this))));
+            // burn up to balance of contract, fallback to burning from supply if needed
+            uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
+            _burn(address(this), toBurn);
+            if (toBurn < supplyDelta) {
+                // burn remaining from total supply by burning from treasury if available
+                uint256 remaining = supplyDelta - toBurn;
+                if (balanceOf(treasury) >= remaining) {
+                    super._transfer(treasury, address(0), remaining);
+                } else {
+                    // if treasury insufficient, just burn what we can
+                    uint256 canBurn = balanceOf(treasury);
+                    if (canBurn > 0) super._transfer(treasury, address(0), canBurn);
+                }
+            }
+        }
+
+        lastRebase = block.timestamp;
+        emit Rebased(supplyDelta);
+    }
+
+    // Manual rebase in emergencies (governance can call with a trusted override price)
+    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused {
+        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
+        uint256 price = priceOverride;
+        uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
+        require(deviation >= int256(rebaseThreshold), "No significant deviation");
+
+        uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
+        if (price > targetPrice) {
+            _mint(address(this), supplyDelta);
+        } else {
+            uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
+            _burn(address(this), toBurn);
         }
 
         lastRebase = block.timestamp;
@@ -222,13 +277,51 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         devFund = _devFund;
     }
 
-    // --- Governance Proposal Voting ---
-    function createProposal(string memory description) external onlyRole(GOVERNANCE_ROLE) {
+    // --- Treasury Management ---
+    function setTreasury(address _treasury) external onlyRole(GOVERNANCE_ROLE) {
+        treasury = _treasury;
+        emit TreasuryUpdated(_treasury);
+    }
+
+    function withdrawFromTreasury(address token, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
+        require(token != address(this), "Use recoverTokens for ASTC");
+        IERC20(token).safeTransfer(msg.sender, amount);
+    }
+
+    // --- Slashing (governance power) ---
+    function slash(address user, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
+        require(user != address(0), "Invalid user");
+        require(amount > 0, "Invalid amount");
+        uint256 bal = balanceOf(user);
+        uint256 toSlash = Math.min(bal, amount);
+        if (toSlash == 0) return;
+        // move tokens to treasury without applying transfer fees
+        super._transfer(user, treasury, toSlash);
+        emit Slashed(user, toSlash);
+    }
+
+    // --- Emergency Manual Oracle ---
+    function setManualOracle(uint256 price, bool enabled) external onlyRole(GOVERNANCE_ROLE) {
+        manualPrice = price;
+        useManualOracle = enabled;
+        emit ManualOracleSet(price, enabled);
+    }
+
+    function _getPrice() internal view returns (uint256) {
+        if (useManualOracle) return manualPrice;
+        return oracle.getPrice();
+    }
+
+    // --- Governance Proposal Voting (with execution hook) ---
+    function createProposal(string memory description, address execTarget, uint256 execValue, bytes memory execData) external onlyRole(GOVERNANCE_ROLE) {
         proposals[proposalCount] = Proposal({
             description: description,
             voteCount: 0,
             createdAt: block.timestamp,
-            executed: false
+            executed: false,
+            execTarget: execTarget,
+            execValue: execValue,
+            execData: execData
         });
         emit ProposalCreated(proposalCount, description);
         proposalCount++;
@@ -239,31 +332,47 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         Proposal storage p = proposals[id];
         require(!hasVoted[id][msg.sender], "Already voted");
         require(!p.executed, "Already executed");
-        p.voteCount++;
         hasVoted[id][msg.sender] = true;
+        p.voteCount++;
         emit Voted(id, msg.sender);
     }
 
+    // execute only after voting period ends
     function executeProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
         require(id < proposalCount, "Invalid proposal");
         Proposal storage p = proposals[id];
         require(!p.executed, "Already executed");
-        require(block.timestamp <= p.createdAt + VOTE_DURATION, "Voting expired");
-        require(p.voteCount >= 2, "Not enough votes");
+        require(block.timestamp >= p.createdAt + VOTE_DURATION, "Voting still ongoing");
+        require(p.voteCount >= proposalQuorum, "Not enough votes");
+
         p.executed = true;
         emit ProposalExecuted(id);
+
+        // attempt to execute arbitrary call if target provided
+        if (p.execTarget != address(0)) {
+            (bool success, ) = p.execTarget.call{value: p.execValue}(p.execData);
+            require(success, "Proposal exec failed");
+        }
+    }
+
+    function setProposalQuorum(uint256 q) external onlyRole(GOVERNANCE_ROLE) {
+        proposalQuorum = q;
     }
 
     // --- ERC20 Override ---
     function _transfer(address from, address to, uint256 amount) internal override {
-        if (from == address(this) || to == address(this) || hasRole(GOVERNANCE_ROLE, from)) {
+        // allow internal contract movements, governance and bridge/treasury operations to bypass fees
+        if (from == address(this) || to == address(this) || hasRole(GOVERNANCE_ROLE, from) || from == treasury) {
             super._transfer(from, to, amount);
         } else {
             uint256 burnAmount = (amount * burnPercent) / 100;
             uint256 devAmount = (amount * devPercent) / 100;
             uint256 finalAmount = amount - burnAmount - devAmount;
-            super._transfer(from, address(0), burnAmount);
-            super._transfer(from, devFund, devAmount);
+            // burn
+            if (burnAmount > 0) super._transfer(from, address(0), burnAmount);
+            // dev
+            if (devAmount > 0) super._transfer(from, devFund, devAmount);
+            // main transfer
             super._transfer(from, to, finalAmount);
         }
     }
@@ -274,9 +383,23 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         uint256 bal = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransfer(msg.sender, bal);
     }
+
+    // --- Setters for Rebase params ---
+    function setTargetPrice(uint256 price) external onlyRole(GOVERNANCE_ROLE) {
+        targetPrice = price;
+        emit TargetPriceUpdated(price);
+    }
+
+    function setRebaseThreshold(uint256 threshold) external onlyRole(GOVERNANCE_ROLE) {
+        rebaseThreshold = threshold;
+        emit RebaseThresholdUpdated(threshold);
+    }
+
+    function setRebaseCooldown(uint256 cooldown) external onlyRole(GOVERNANCE_ROLE) {
+        rebaseCooldown = cooldown;
+    }
+
+    // Allow contract to receive ETH if proposals need to send ETH
+    receive() external payable {}
+    fallback() external payable {}
 }
-
-
-
-
-
