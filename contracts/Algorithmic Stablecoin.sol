@@ -7,64 +7,44 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
-interface IOracle {
-    function getPrice() external view returns (uint256);
-}
-
-interface IFlashLoanReceiver {
-    function executeOperation(uint256 amount, uint256 fee, bytes calldata data) external;
-}
+interface IOracle { function getPrice() external view returns (uint256); }
+interface IFlashLoanReceiver { function executeOperation(uint256 amount, uint256 fee, bytes calldata data) external; }
 
 contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // Roles
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant KYC_PROVIDER_ROLE = keccak256("KYC_PROVIDER_ROLE");
 
-    // Rebase
-    uint256 public lastRebase;
-    uint256 public rebaseCooldown = 1 days;
     IOracle public oracle;
-    uint256 public targetPrice = 1e18; // 1.0
-    uint256 public rebaseThreshold = 0.05e18; // 5%
-
-    // Manual oracle override
-    bool public useManualOracle;
-    uint256 public manualPrice;
-
-    // Staking
-    struct StakeInfo {
-        uint256 amount;
-        uint256 rewardDebt;
-        uint256 lastClaimed;
-    }
-    mapping(address => StakeInfo) public stakes;
-    uint256 public accRewardPerToken;
-    uint256 public lastRewardTime;
-    uint256 public rewardRate = 1e16;
-
-    // Circuit Breaker
-    bool public circuitBreaker;
-
-    // Bridge
-    mapping(address => bool) public bridgeApproved;
-
-    // Fees
-    uint256 public burnPercent = 1;
-    uint256 public devPercent = 1;
     address public devFund;
-
-    // Treasury
     address public treasury;
 
-    // KYC
-    mapping(address => bool) public isKYCed;
-
-    // Flash Loan
+    // Configurable params
+    uint256 public targetPrice = 1e18;
+    uint256 public rebaseThreshold = 0.05e18;
+    uint256 public rebaseCooldown = 1 days;
+    uint256 public burnPercent = 1;
+    uint256 public devPercent = 1;
     uint256 public flashLoanFeeBps = 5;
+    uint256 public rewardRate = 1e16;
+    uint256 public proposalQuorum = 2;
 
-    // Governance Proposal Voting
+    // State vars
+    bool public circuitBreaker;
+    bool public useManualOracle;
+    uint256 public manualPrice;
+    uint256 public lastRebase;
+    uint256 public accRewardPerToken;
+    uint256 public lastRewardTime;
+    uint256 public proposalCount;
+
+    mapping(address => bool) public isKYCed;
+    mapping(address => bool) public bridgeApproved;
+
+    struct StakeInfo { uint256 amount; uint256 rewardDebt; uint256 lastClaimed; }
+    mapping(address => StakeInfo) public stakes;
+
     struct Proposal {
         string description;
         uint256 voteCount;
@@ -74,11 +54,8 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         uint256 execValue;
         bytes execData;
     }
-    uint256 public constant VOTE_DURATION = 3 days;
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
-    uint256 public proposalCount;
-    uint256 public proposalQuorum = 2; // default votes required
 
     // Events
     event Rebased(uint256 supplyDelta);
@@ -100,306 +77,170 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event TargetPriceUpdated(uint256 price);
     event RebaseThresholdUpdated(uint256 threshold);
 
-    modifier onlyKYCed() {
-        require(isKYCed[msg.sender], "Not KYCed");
-        _;
-    }
-
-    modifier notPaused() {
-        require(!circuitBreaker, "Circuit breaker active");
-        _;
-    }
+    modifier onlyKYCed() { require(isKYCed[msg.sender], "Not KYCed"); _; }
+    modifier notPaused() { require(!circuitBreaker, "Circuit breaker active"); _; }
 
     constructor(address _oracle, address _devFund) ERC20("Algorithmic Stablecoin", "ASTC") {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(GOVERNANCE_ROLE, msg.sender);
         oracle = IOracle(_oracle);
-        devFund = _devFund;
-        treasury = _devFund;
+        devFund = treasury = _devFund;
         lastRewardTime = block.timestamp;
     }
 
     // --- KYC ---
-    function approveKYC(address user) external onlyRole(KYC_PROVIDER_ROLE) {
-        isKYCed[user] = true;
-        emit KYCApproved(user);
-    }
-
-    function revokeKYC(address user) external onlyRole(KYC_PROVIDER_ROLE) {
-        isKYCed[user] = false;
-        emit KYCRevoked(user);
-    }
+    function approveKYC(address u) external onlyRole(KYC_PROVIDER_ROLE) { isKYCed[u] = true; emit KYCApproved(u); }
+    function revokeKYC(address u) external onlyRole(KYC_PROVIDER_ROLE) { isKYCed[u] = false; emit KYCRevoked(u); }
 
     // --- Rebase ---
-    function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused {
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-        uint256 price = _getPrice();
+    function _doRebase(uint256 price) internal {
         uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
         require(deviation >= int256(rebaseThreshold), "No significant deviation");
-
         uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
-        if (price > targetPrice) {
-            _mint(address(this), supplyDelta);
-        } else {
-            // burn up to balance of contract, fallback to burning from supply if needed
+
+        if (price > targetPrice) _mint(address(this), supplyDelta);
+        else {
             uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
             _burn(address(this), toBurn);
-            if (toBurn < supplyDelta) {
-                // burn remaining from total supply by burning from treasury if available
-                uint256 remaining = supplyDelta - toBurn;
-                if (balanceOf(treasury) >= remaining) {
-                    super._transfer(treasury, address(0), remaining);
-                } else {
-                    // if treasury insufficient, just burn what we can
-                    uint256 canBurn = balanceOf(treasury);
-                    if (canBurn > 0) super._transfer(treasury, address(0), canBurn);
-                }
+            uint256 remaining = supplyDelta - toBurn;
+            if (remaining > 0) {
+                uint256 treasuryBal = balanceOf(treasury);
+                super._transfer(treasury, address(0), Math.min(remaining, treasuryBal));
             }
         }
-
         lastRebase = block.timestamp;
         emit Rebased(supplyDelta);
     }
 
-    // Manual rebase in emergencies (governance can call with a trusted override price)
-    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused {
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-        uint256 price = priceOverride;
-        uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
-        require(deviation >= int256(rebaseThreshold), "No significant deviation");
-
-        uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
-        if (price > targetPrice) {
-            _mint(address(this), supplyDelta);
-        } else {
-            uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
-            _burn(address(this), toBurn);
-        }
-
-        lastRebase = block.timestamp;
-        emit Rebased(supplyDelta);
+    function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused { 
+        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown"); 
+        _doRebase(_getPrice()); 
+    }
+    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused { 
+        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown"); 
+        _doRebase(priceOverride); 
     }
 
     // --- Staking ---
-    function stake(uint256 amount) external onlyKYCed notPaused nonReentrant {
-        require(amount > 0, "Invalid amount");
+    function stake(uint256 a) external onlyKYCed notPaused nonReentrant {
+        require(a > 0, "Invalid amount");
         _updateRewards(msg.sender);
-        _transfer(msg.sender, address(this), amount);
-        stakes[msg.sender].amount += amount;
-        emit Staked(msg.sender, amount);
+        _transfer(msg.sender, address(this), a);
+        stakes[msg.sender].amount += a;
+        emit Staked(msg.sender, a);
     }
-
-    function unstake(uint256 amount) external onlyKYCed notPaused nonReentrant {
-        require(amount > 0 && stakes[msg.sender].amount >= amount, "Insufficient stake");
+    function unstake(uint256 a) external onlyKYCed notPaused nonReentrant {
+        require(a > 0 && stakes[msg.sender].amount >= a, "Insufficient stake");
         _updateRewards(msg.sender);
-        stakes[msg.sender].amount -= amount;
-        _transfer(address(this), msg.sender, amount);
-        emit Unstaked(msg.sender, amount);
+        stakes[msg.sender].amount -= a;
+        _transfer(address(this), msg.sender, a);
+        emit Unstaked(msg.sender, a);
     }
-
     function claimRewards() external onlyKYCed notPaused nonReentrant {
         _updateRewards(msg.sender);
-        uint256 reward = stakes[msg.sender].rewardDebt;
-        require(reward > 0, "No rewards");
+        uint256 r = stakes[msg.sender].rewardDebt;
+        require(r > 0, "No rewards");
         stakes[msg.sender].rewardDebt = 0;
-        _mint(msg.sender, reward);
-        emit Claimed(msg.sender, reward);
+        _mint(msg.sender, r);
+        emit Claimed(msg.sender, r);
     }
-
-    function _updateRewards(address user) internal {
+    function _updateRewards(address u) internal {
         if (block.timestamp > lastRewardTime && totalStaked() > 0) {
-            uint256 duration = block.timestamp - lastRewardTime;
-            uint256 reward = duration * rewardRate;
+            uint256 reward = (block.timestamp - lastRewardTime) * rewardRate;
             accRewardPerToken += (reward * 1e18) / totalStaked();
             lastRewardTime = block.timestamp;
         }
-        uint256 userReward = ((stakes[user].amount * accRewardPerToken) / 1e18) - stakes[user].rewardDebt;
-        stakes[user].rewardDebt += userReward;
-        stakes[user].lastClaimed = block.timestamp;
+        uint256 earned = ((stakes[u].amount * accRewardPerToken) / 1e18) - stakes[u].rewardDebt;
+        stakes[u].rewardDebt += earned;
+        stakes[u].lastClaimed = block.timestamp;
     }
-
-    function totalStaked() public view returns (uint256) {
-        return balanceOf(address(this));
-    }
+    function totalStaked() public view returns (uint256) { return balanceOf(address(this)); }
 
     // --- Bridge ---
-    function bridgeTransfer(uint256 amount, string memory targetChain) external onlyKYCed notPaused nonReentrant {
-        require(amount > 0 && balanceOf(msg.sender) >= amount, "Invalid amount");
-        _burn(msg.sender, amount);
-        emit BridgeTransfer(msg.sender, amount, targetChain);
+    function bridgeTransfer(uint256 a, string memory chain) external onlyKYCed notPaused nonReentrant {
+        require(a > 0 && balanceOf(msg.sender) >= a, "Invalid amount");
+        _burn(msg.sender, a);
+        emit BridgeTransfer(msg.sender, a, chain);
     }
-
-    function setBridge(address bridge, bool approved) external onlyRole(GOVERNANCE_ROLE) {
-        bridgeApproved[bridge] = approved;
-    }
+    function setBridge(address b, bool ok) external onlyRole(GOVERNANCE_ROLE) { bridgeApproved[b] = ok; }
 
     // --- Circuit Breaker ---
-    function toggleCircuitBreaker(bool state) external onlyRole(GOVERNANCE_ROLE) {
-        circuitBreaker = state;
-        emit CircuitBreakerTriggered(state);
-    }
+    function toggleCircuitBreaker(bool s) external onlyRole(GOVERNANCE_ROLE) { circuitBreaker = s; emit CircuitBreakerTriggered(s); }
 
     // --- Flash Loan ---
-    function flashLoan(address receiver, uint256 amount, bytes calldata data) external nonReentrant notPaused {
-        require(receiver != address(0), "Invalid receiver");
-        require(amount > 0 && amount <= balanceOf(address(this)), "Invalid loan amount");
-        uint256 fee = (amount * flashLoanFeeBps) / 10_000;
-        uint256 repayment = amount + fee;
-        _transfer(address(this), receiver, amount);
-        IFlashLoanReceiver(receiver).executeOperation(amount, fee, data);
-        require(balanceOf(address(this)) >= repayment, "Flash loan not repaid");
-        _transfer(receiver, address(this), repayment);
-        emit FlashLoan(receiver, amount, fee);
+    function flashLoan(address r, uint256 a, bytes calldata data) external nonReentrant notPaused {
+        require(r != address(0) && a > 0 && a <= balanceOf(address(this)), "Invalid loan");
+        uint256 fee = (a * flashLoanFeeBps) / 10_000;
+        uint256 repayment = a + fee;
+        _transfer(address(this), r, a);
+        IFlashLoanReceiver(r).executeOperation(a, fee, data);
+        require(balanceOf(address(this)) >= repayment, "Not repaid");
+        _transfer(r, address(this), repayment);
+        emit FlashLoan(r, a, fee);
     }
 
-    function setFlashLoanFee(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
-        require(bps <= 100, "Fee too high");
-        flashLoanFeeBps = bps;
+    // --- Governance ---
+    function createProposal(string memory d, address t, uint256 v, bytes memory data) external onlyRole(GOVERNANCE_ROLE) {
+        proposals[proposalCount] = Proposal(d, 0, block.timestamp, false, t, v, data);
+        emit ProposalCreated(proposalCount++, d);
     }
-
-    // --- Admin Config ---
-    function setOracle(address _oracle) external onlyRole(GOVERNANCE_ROLE) {
-        oracle = IOracle(_oracle);
-    }
-
-    function setRewardRate(uint256 rate) external onlyRole(GOVERNANCE_ROLE) {
-        rewardRate = rate;
-    }
-
-    function setFees(uint256 _burn, uint256 _dev) external onlyRole(GOVERNANCE_ROLE) {
-        require(_burn <= 100 && _dev <= 100, "Too high");
-        burnPercent = _burn;
-        devPercent = _dev;
-        emit FeesUpdated(_burn, _dev);
-    }
-
-    function setDevFund(address _devFund) external onlyRole(GOVERNANCE_ROLE) {
-        devFund = _devFund;
-    }
-
-    // --- Treasury Management ---
-    function setTreasury(address _treasury) external onlyRole(GOVERNANCE_ROLE) {
-        treasury = _treasury;
-        emit TreasuryUpdated(_treasury);
-    }
-
-    function withdrawFromTreasury(address token, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
-        require(token != address(this), "Use recoverTokens for ASTC");
-        IERC20(token).safeTransfer(msg.sender, amount);
-    }
-
-    // --- Slashing (governance power) ---
-    function slash(address user, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
-        require(user != address(0), "Invalid user");
-        require(amount > 0, "Invalid amount");
-        uint256 bal = balanceOf(user);
-        uint256 toSlash = Math.min(bal, amount);
-        if (toSlash == 0) return;
-        // move tokens to treasury without applying transfer fees
-        super._transfer(user, treasury, toSlash);
-        emit Slashed(user, toSlash);
-    }
-
-    // --- Emergency Manual Oracle ---
-    function setManualOracle(uint256 price, bool enabled) external onlyRole(GOVERNANCE_ROLE) {
-        manualPrice = price;
-        useManualOracle = enabled;
-        emit ManualOracleSet(price, enabled);
-    }
-
-    function _getPrice() internal view returns (uint256) {
-        if (useManualOracle) return manualPrice;
-        return oracle.getPrice();
-    }
-
-    // --- Governance Proposal Voting (with execution hook) ---
-    function createProposal(string memory description, address execTarget, uint256 execValue, bytes memory execData) external onlyRole(GOVERNANCE_ROLE) {
-        proposals[proposalCount] = Proposal({
-            description: description,
-            voteCount: 0,
-            createdAt: block.timestamp,
-            executed: false,
-            execTarget: execTarget,
-            execValue: execValue,
-            execData: execData
-        });
-        emit ProposalCreated(proposalCount, description);
-        proposalCount++;
-    }
-
     function voteProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
-        require(id < proposalCount, "Invalid proposal");
         Proposal storage p = proposals[id];
-        require(!hasVoted[id][msg.sender], "Already voted");
-        require(!p.executed, "Already executed");
+        require(!p.executed && !hasVoted[id][msg.sender], "Invalid vote");
         hasVoted[id][msg.sender] = true;
         p.voteCount++;
         emit Voted(id, msg.sender);
     }
-
-    // execute only after voting period ends
     function executeProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
-        require(id < proposalCount, "Invalid proposal");
         Proposal storage p = proposals[id];
-        require(!p.executed, "Already executed");
-        require(block.timestamp >= p.createdAt + VOTE_DURATION, "Voting still ongoing");
-        require(p.voteCount >= proposalQuorum, "Not enough votes");
-
+        require(!p.executed && block.timestamp >= p.createdAt + 3 days && p.voteCount >= proposalQuorum, "Cannot execute");
         p.executed = true;
         emit ProposalExecuted(id);
-
-        // attempt to execute arbitrary call if target provided
         if (p.execTarget != address(0)) {
-            (bool success, ) = p.execTarget.call{value: p.execValue}(p.execData);
-            require(success, "Proposal exec failed");
+            (bool ok, ) = p.execTarget.call{value: p.execValue}(p.execData);
+            require(ok, "Exec failed");
         }
     }
 
-    function setProposalQuorum(uint256 q) external onlyRole(GOVERNANCE_ROLE) {
-        proposalQuorum = q;
+    // --- Admin Config ---
+    function setOracle(address o) external onlyRole(GOVERNANCE_ROLE) { oracle = IOracle(o); }
+    function setRewardRate(uint256 r) external onlyRole(GOVERNANCE_ROLE) { rewardRate = r; }
+    function setFees(uint256 b, uint256 d) external onlyRole(GOVERNANCE_ROLE) { require(b <= 100 && d <= 100, "Too high"); burnPercent=b; devPercent=d; emit FeesUpdated(b,d); }
+    function setDevFund(address d) external onlyRole(GOVERNANCE_ROLE) { devFund = d; }
+    function setTreasury(address t) external onlyRole(GOVERNANCE_ROLE) { treasury = t; emit TreasuryUpdated(t); }
+    function withdrawFromTreasury(address token, uint256 a) external onlyRole(GOVERNANCE_ROLE) { require(token != address(this)); IERC20(token).safeTransfer(msg.sender, a); }
+    function slash(address u, uint256 a) external onlyRole(GOVERNANCE_ROLE) {
+        uint256 bal = balanceOf(u);
+        if (bal > 0) super._transfer(u, treasury, Math.min(bal, a));
+        emit Slashed(u, Math.min(bal, a));
     }
+    function setManualOracle(uint256 p, bool e) external onlyRole(GOVERNANCE_ROLE) { manualPrice=p; useManualOracle=e; emit ManualOracleSet(p,e); }
+    function setTargetPrice(uint256 p) external onlyRole(GOVERNANCE_ROLE) { targetPrice=p; emit TargetPriceUpdated(p); }
+    function setRebaseThreshold(uint256 t) external onlyRole(GOVERNANCE_ROLE) { rebaseThreshold=t; emit RebaseThresholdUpdated(t); }
+    function setRebaseCooldown(uint256 c) external onlyRole(GOVERNANCE_ROLE) { rebaseCooldown=c; }
+    function setProposalQuorum(uint256 q) external onlyRole(GOVERNANCE_ROLE) { proposalQuorum=q; }
 
     // --- ERC20 Override ---
-    function _transfer(address from, address to, uint256 amount) internal override {
-        // allow internal contract movements, governance and bridge/treasury operations to bypass fees
-        if (from == address(this) || to == address(this) || hasRole(GOVERNANCE_ROLE, from) || from == treasury) {
-            super._transfer(from, to, amount);
-        } else {
-            uint256 burnAmount = (amount * burnPercent) / 100;
-            uint256 devAmount = (amount * devPercent) / 100;
-            uint256 finalAmount = amount - burnAmount - devAmount;
-            // burn
-            if (burnAmount > 0) super._transfer(from, address(0), burnAmount);
-            // dev
-            if (devAmount > 0) super._transfer(from, devFund, devAmount);
-            // main transfer
-            super._transfer(from, to, finalAmount);
+    function _transfer(address f, address t, uint256 a) internal override {
+        if (f == address(this) || t == address(this) || hasRole(GOVERNANCE_ROLE, f) || f == treasury) 
+            super._transfer(f, t, a);
+        else {
+            uint256 b = (a * burnPercent) / 100;
+            uint256 d = (a * devPercent) / 100;
+            super._transfer(f, address(0), b);
+            super._transfer(f, devFund, d);
+            super._transfer(f, t, a - b - d);
         }
     }
 
-    // --- Recover Tokens ---
     function recoverTokens(address token) external onlyRole(GOVERNANCE_ROLE) {
-        require(token != address(this), "Can't recover ASTC");
-        uint256 bal = IERC20(token).balanceOf(address(this));
-        IERC20(token).safeTransfer(msg.sender, bal);
+        require(token != address(this));
+        IERC20(token).safeTransfer(msg.sender, IERC20(token).balanceOf(address(this)));
     }
 
-    // --- Setters for Rebase params ---
-    function setTargetPrice(uint256 price) external onlyRole(GOVERNANCE_ROLE) {
-        targetPrice = price;
-        emit TargetPriceUpdated(price);
-    }
+    function _getPrice() internal view returns (uint256) { return useManualOracle ? manualPrice : oracle.getPrice(); }
 
-    function setRebaseThreshold(uint256 threshold) external onlyRole(GOVERNANCE_ROLE) {
-        rebaseThreshold = threshold;
-        emit RebaseThresholdUpdated(threshold);
-    }
-
-    function setRebaseCooldown(uint256 cooldown) external onlyRole(GOVERNANCE_ROLE) {
-        rebaseCooldown = cooldown;
-    }
-
-    // Allow contract to receive ETH if proposals need to send ETH
     receive() external payable {}
     fallback() external payable {}
 }
+
