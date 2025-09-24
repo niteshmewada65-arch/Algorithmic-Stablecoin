@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 interface IOracle { function getPrice() external view returns (uint256); }
 interface IFlashLoanReceiver { function executeOperation(uint256 amount, uint256 fee, bytes calldata data) external; }
@@ -29,6 +30,14 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     uint256 public flashLoanFeeBps = 5;
     uint256 public rewardRate = 1e16;
     uint256 public proposalQuorum = 2;
+
+    // New: max supply cap (0 means no cap)
+    uint256 public maxSupply;
+
+    // Transfer limit (anti-whale): percentage (bps style: e.g., 100 = 1%)
+    // For simplicity store in basis points of total supply (10000 = 100%)
+    uint256 public transferLimitBps = 1000; // default 10% of total supply per tx (adjustable)
+    mapping(address => bool) public transferLimitExempt;
 
     // State vars
     bool public circuitBreaker;
@@ -57,7 +66,7 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
-    // Events
+    // Events (added some new events)
     event Rebased(uint256 supplyDelta);
     event Staked(address indexed user, uint256 amount);
     event Claimed(address indexed user, uint256 reward);
@@ -77,6 +86,14 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event TargetPriceUpdated(uint256 price);
     event RebaseThresholdUpdated(uint256 threshold);
 
+    // New events
+    event MaxSupplyUpdated(uint256 newMaxSupply);
+    event TransferLimitUpdated(uint256 newLimitBps);
+    event TransferLimitExemptToggled(address account, bool exempt);
+    event EmergencyWithdrawn(address indexed to, uint256 amount);
+    event EmergencyERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
+    event FlashLoanFeeUpdated(uint256 newBps);
+
     modifier onlyKYCed() { require(isKYCed[msg.sender], "Not KYCed"); _; }
     modifier notPaused() { require(!circuitBreaker, "Circuit breaker active"); _; }
 
@@ -86,6 +103,12 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         oracle = IOracle(_oracle);
         devFund = treasury = _devFund;
         lastRewardTime = block.timestamp;
+
+        // Exempt important addresses from transfer limits by default
+        transferLimitExempt[msg.sender] = true;
+        transferLimitExempt[address(this)] = true;
+        transferLimitExempt[devFund] = true;
+        transferLimitExempt[treasury] = true;
     }
 
     // --- KYC ---
@@ -94,31 +117,45 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
 
     // --- Rebase ---
     function _doRebase(uint256 price) internal {
-        uint256 deviation = Math.abs(int256(price) - int256(targetPrice));
-        require(deviation >= int256(rebaseThreshold), "No significant deviation");
+        // safer deviation calculation
+        uint256 deviation = price > targetPrice ? price - targetPrice : targetPrice - price;
+        require(deviation >= rebaseThreshold, "No significant deviation");
+
+        // supplyDelta = totalSupply * (deviation / targetPrice)
         uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
 
-        if (price > targetPrice) _mint(address(this), supplyDelta);
-        else {
+        if (price > targetPrice) {
+            // mint to contract (or to treasury) but respect maxSupply if set
+            if (maxSupply > 0) {
+                uint256 available = maxSupply > totalSupply() ? maxSupply - totalSupply() : 0;
+                uint256 toMint = supplyDelta <= available ? supplyDelta : available;
+                if (toMint > 0) _mint(address(this), toMint);
+            } else {
+                _mint(address(this), supplyDelta);
+            }
+        } else {
+            // deflation path: burn from contract then from treasury if needed
             uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
-            _burn(address(this), toBurn);
-            uint256 remaining = supplyDelta - toBurn;
+            if (toBurn > 0) _burn(address(this), toBurn);
+            uint256 remaining = supplyDelta > toBurn ? supplyDelta - toBurn : 0;
             if (remaining > 0) {
                 uint256 treasuryBal = balanceOf(treasury);
-                super._transfer(treasury, address(0), Math.min(remaining, treasuryBal));
+                uint256 burnFromTreasury = Math.min(remaining, treasuryBal);
+                if (burnFromTreasury > 0) super._transfer(treasury, address(0), burnFromTreasury);
             }
         }
+
         lastRebase = block.timestamp;
         emit Rebased(supplyDelta);
     }
 
-    function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused { 
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown"); 
-        _doRebase(_getPrice()); 
+    function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused {
+        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
+        _doRebase(_getPrice());
     }
-    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused { 
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown"); 
-        _doRebase(priceOverride); 
+    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused {
+        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
+        _doRebase(priceOverride);
     }
 
     // --- Staking ---
@@ -179,6 +216,12 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
         emit FlashLoan(r, a, fee);
     }
 
+    function setFlashLoanFeeBps(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
+        require(bps <= 1000, "Too high"); // max 10%
+        flashLoanFeeBps = bps;
+        emit FlashLoanFeeUpdated(bps);
+    }
+
     // --- Governance ---
     function createProposal(string memory d, address t, uint256 v, bytes memory data) external onlyRole(GOVERNANCE_ROLE) {
         proposals[proposalCount] = Proposal(d, 0, block.timestamp, false, t, v, data);
@@ -220,17 +263,61 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     function setRebaseCooldown(uint256 c) external onlyRole(GOVERNANCE_ROLE) { rebaseCooldown=c; }
     function setProposalQuorum(uint256 q) external onlyRole(GOVERNANCE_ROLE) { proposalQuorum=q; }
 
-    // --- ERC20 Override ---
+    // --- New: Max Supply ---
+    function setMaxSupply(uint256 _max) external onlyRole(GOVERNANCE_ROLE) {
+        maxSupply = _max;
+        emit MaxSupplyUpdated(_max);
+    }
+
+    // --- New: Transfer limit (anti-whale) ---
+    // transferLimitBps is basis points of totalSupply allowed per txn (10000 == 100%)
+    function setTransferLimitBps(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
+        require(bps <= 10000, "bps>10000");
+        transferLimitBps = bps;
+        emit TransferLimitUpdated(bps);
+    }
+    function setTransferLimitExempt(address account, bool exempt) external onlyRole(GOVERNANCE_ROLE) {
+        transferLimitExempt[account] = exempt;
+        emit TransferLimitExemptToggled(account, exempt);
+    }
+
+    // --- ERC20 Override (transfer tax + anti-whale via _beforeTokenTransfer) ---
     function _transfer(address f, address t, uint256 a) internal override {
         if (f == address(this) || t == address(this) || hasRole(GOVERNANCE_ROLE, f) || f == treasury) 
             super._transfer(f, t, a);
         else {
             uint256 b = (a * burnPercent) / 100;
             uint256 d = (a * devPercent) / 100;
-            super._transfer(f, address(0), b);
-            super._transfer(f, devFund, d);
+            if (b > 0) super._transfer(f, address(0), b);
+            if (d > 0) super._transfer(f, devFund, d);
             super._transfer(f, t, a - b - d);
         }
+    }
+
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal override {
+        super._beforeTokenTransfer(from, to, amount);
+
+        // if transferLimitBps == 0 -> disabled
+        if (transferLimitBps > 0 && from != address(0) && to != address(0)) {
+            if (!transferLimitExempt[from] && !transferLimitExempt[to]) {
+                uint256 maxAllowed = (totalSupply() * transferLimitBps) / 10000;
+                require(amount <= maxAllowed, "Transfer exceeds per-tx limit");
+            }
+        }
+
+        // circuit breaker
+        require(!circuitBreaker, "Transfers paused by circuit breaker");
+    }
+
+    // --- Recovery / Emergency functions ---
+    function emergencyWithdrawETH(address payable to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
+        require(amount <= address(this).balance, "Insufficient ETH");
+        to.transfer(amount);
+        emit EmergencyWithdrawn(to, amount);
+    }
+    function emergencyWithdrawERC20(address token, address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
+        IERC20(token).safeTransfer(to, amount);
+        emit EmergencyERC20Withdrawn(token, to, amount);
     }
 
     function recoverTokens(address token) external onlyRole(GOVERNANCE_ROLE) {
