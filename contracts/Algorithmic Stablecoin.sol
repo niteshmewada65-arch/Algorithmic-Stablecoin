@@ -1,333 +1,315 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
-interface IOracle { function getPrice() external view returns (uint256); }
-interface IFlashLoanReceiver { function executeOperation(uint256 amount, uint256 fee, bytes calldata data) external; }
+contract RentalAgreement is ReentrancyGuard, Pausable {
+    address public admin;
+    uint256 public totalPlatformFees;
 
-contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
-    using SafeERC20 for IERC20;
+    constructor() {
+        admin = msg.sender;
+    }
 
-    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
-    bytes32 public constant KYC_PROVIDER_ROLE = keccak256("KYC_PROVIDER_ROLE");
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Not admin");
+        _;
+    }
 
-    IOracle public oracle;
-    address public devFund;
-    address public treasury;
+    struct Agreement {
+        address tenant;
+        address landlord;
+        uint256 monthlyRent;
+        uint256 agreementEnd;
+        uint256 lastRentPayment;
+        uint256 totalRentPaid;
+        uint256 earlyTerminationFee;
+        uint256 gracePeriodDays;
+        bool isActive;
+        bool autoRenewal;
+        uint256 lateFeesOwed;
+        uint256 securityDeposit;
+    }
 
-    // Configurable params
-    uint256 public targetPrice = 1e18;
-    uint256 public rebaseThreshold = 0.05e18;
-    uint256 public rebaseCooldown = 1 days;
-    uint256 public burnPercent = 1;
-    uint256 public devPercent = 1;
-    uint256 public flashLoanFeeBps = 5;
-    uint256 public rewardRate = 1e16;
-    uint256 public proposalQuorum = 2;
+    struct MaintenanceRequest {
+        uint256 agreementId;
+        bool isApproved;
+        address assignedContractor;
+        uint256 estimatedCost;
+        bool landlordFunded;
+    }
 
-    // New: max supply cap (0 means no cap)
-    uint256 public maxSupply;
-
-    // Transfer limit (anti-whale): percentage (bps style: e.g., 100 = 1%)
-    // For simplicity store in basis points of total supply (10000 = 100%)
-    uint256 public transferLimitBps = 1000; // default 10% of total supply per tx (adjustable)
-    mapping(address => bool) public transferLimitExempt;
-
-    // State vars
-    bool public circuitBreaker;
-    bool public useManualOracle;
-    uint256 public manualPrice;
-    uint256 public lastRebase;
-    uint256 public accRewardPerToken;
-    uint256 public lastRewardTime;
-    uint256 public proposalCount;
-
-    mapping(address => bool) public isKYCed;
-    mapping(address => bool) public bridgeApproved;
-
-    struct StakeInfo { uint256 amount; uint256 rewardDebt; uint256 lastClaimed; }
-    mapping(address => StakeInfo) public stakes;
-
-    struct Proposal {
+    struct EmergencyMaintenance {
+        uint256 agreementId;
+        address raisedBy;
         string description;
-        uint256 voteCount;
-        uint256 createdAt;
-        bool executed;
-        address execTarget;
-        uint256 execValue;
-        bytes execData;
-    }
-    mapping(uint256 => Proposal) public proposals;
-    mapping(uint256 => mapping(address => bool)) public hasVoted;
-
-    // Events (added some new events)
-    event Rebased(uint256 supplyDelta);
-    event Staked(address indexed user, uint256 amount);
-    event Claimed(address indexed user, uint256 reward);
-    event Unstaked(address indexed user, uint256 amount);
-    event BridgeTransfer(address indexed user, uint256 amount, string targetChain);
-    event KYCApproved(address indexed user);
-    event KYCRevoked(address indexed user);
-    event CircuitBreakerTriggered(bool status);
-    event FeesUpdated(uint256 burnPercent, uint256 devPercent);
-    event FlashLoan(address indexed receiver, uint256 amount, uint256 fee);
-    event ProposalCreated(uint256 indexed id, string description);
-    event Voted(uint256 indexed id, address voter);
-    event ProposalExecuted(uint256 indexed id);
-    event TreasuryUpdated(address indexed treasury);
-    event Slashed(address indexed user, uint256 amount);
-    event ManualOracleSet(uint256 price, bool enabled);
-    event TargetPriceUpdated(uint256 price);
-    event RebaseThresholdUpdated(uint256 threshold);
-
-    // New events
-    event MaxSupplyUpdated(uint256 newMaxSupply);
-    event TransferLimitUpdated(uint256 newLimitBps);
-    event TransferLimitExemptToggled(address account, bool exempt);
-    event EmergencyWithdrawn(address indexed to, uint256 amount);
-    event EmergencyERC20Withdrawn(address indexed token, address indexed to, uint256 amount);
-    event FlashLoanFeeUpdated(uint256 newBps);
-
-    modifier onlyKYCed() { require(isKYCed[msg.sender], "Not KYCed"); _; }
-    modifier notPaused() { require(!circuitBreaker, "Circuit breaker active"); _; }
-
-    constructor(address _oracle, address _devFund) ERC20("Algorithmic Stablecoin", "ASTC") {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(GOVERNANCE_ROLE, msg.sender);
-        oracle = IOracle(_oracle);
-        devFund = treasury = _devFund;
-        lastRewardTime = block.timestamp;
-
-        // Exempt important addresses from transfer limits by default
-        transferLimitExempt[msg.sender] = true;
-        transferLimitExempt[address(this)] = true;
-        transferLimitExempt[devFund] = true;
-        transferLimitExempt[treasury] = true;
+        uint256 timestamp;
+        bool resolved;
     }
 
-    // --- KYC ---
-    function approveKYC(address u) external onlyRole(KYC_PROVIDER_ROLE) { isKYCed[u] = true; emit KYCApproved(u); }
-    function revokeKYC(address u) external onlyRole(KYC_PROVIDER_ROLE) { isKYCed[u] = false; emit KYCRevoked(u); }
-
-    // --- Rebase ---
-    function _doRebase(uint256 price) internal {
-        // safer deviation calculation
-        uint256 deviation = price > targetPrice ? price - targetPrice : targetPrice - price;
-        require(deviation >= rebaseThreshold, "No significant deviation");
-
-        // supplyDelta = totalSupply * (deviation / targetPrice)
-        uint256 supplyDelta = (totalSupply() * deviation) / targetPrice;
-
-        if (price > targetPrice) {
-            // mint to contract (or to treasury) but respect maxSupply if set
-            if (maxSupply > 0) {
-                uint256 available = maxSupply > totalSupply() ? maxSupply - totalSupply() : 0;
-                uint256 toMint = supplyDelta <= available ? supplyDelta : available;
-                if (toMint > 0) _mint(address(this), toMint);
-            } else {
-                _mint(address(this), supplyDelta);
-            }
-        } else {
-            // deflation path: burn from contract then from treasury if needed
-            uint256 toBurn = Math.min(supplyDelta, balanceOf(address(this)));
-            if (toBurn > 0) _burn(address(this), toBurn);
-            uint256 remaining = supplyDelta > toBurn ? supplyDelta - toBurn : 0;
-            if (remaining > 0) {
-                uint256 treasuryBal = balanceOf(treasury);
-                uint256 burnFromTreasury = Math.min(remaining, treasuryBal);
-                if (burnFromTreasury > 0) super._transfer(treasury, address(0), burnFromTreasury);
-            }
-        }
-
-        lastRebase = block.timestamp;
-        emit Rebased(supplyDelta);
+    struct Dispute {
+        uint256 agreementId;
+        address raisedBy;
+        string reason;
+        bool resolved;
+        string resolutionNote;
     }
 
-    function rebase() external onlyRole(GOVERNANCE_ROLE) notPaused {
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-        _doRebase(_getPrice());
-    }
-    function manualRebase(uint256 priceOverride) external onlyRole(GOVERNANCE_ROLE) notPaused {
-        require(block.timestamp >= lastRebase + rebaseCooldown, "Cooldown");
-        _doRebase(priceOverride);
+    struct PaymentRecord {
+        uint256 agreementId;
+        uint256 amount;
+        uint256 timestamp;
     }
 
-    // --- Staking ---
-    function stake(uint256 a) external onlyKYCed notPaused nonReentrant {
-        require(a > 0, "Invalid amount");
-        _updateRewards(msg.sender);
-        _transfer(msg.sender, address(this), a);
-        stakes[msg.sender].amount += a;
-        emit Staked(msg.sender, a);
-    }
-    function unstake(uint256 a) external onlyKYCed notPaused nonReentrant {
-        require(a > 0 && stakes[msg.sender].amount >= a, "Insufficient stake");
-        _updateRewards(msg.sender);
-        stakes[msg.sender].amount -= a;
-        _transfer(address(this), msg.sender, a);
-        emit Unstaked(msg.sender, a);
-    }
-    function claimRewards() external onlyKYCed notPaused nonReentrant {
-        _updateRewards(msg.sender);
-        uint256 r = stakes[msg.sender].rewardDebt;
-        require(r > 0, "No rewards");
-        stakes[msg.sender].rewardDebt = 0;
-        _mint(msg.sender, r);
-        emit Claimed(msg.sender, r);
-    }
-    function _updateRewards(address u) internal {
-        if (block.timestamp > lastRewardTime && totalStaked() > 0) {
-            uint256 reward = (block.timestamp - lastRewardTime) * rewardRate;
-            accRewardPerToken += (reward * 1e18) / totalStaked();
-            lastRewardTime = block.timestamp;
-        }
-        uint256 earned = ((stakes[u].amount * accRewardPerToken) / 1e18) - stakes[u].rewardDebt;
-        stakes[u].rewardDebt += earned;
-        stakes[u].lastClaimed = block.timestamp;
-    }
-    function totalStaked() public view returns (uint256) { return balanceOf(address(this)); }
+    mapping(uint256 => Agreement) public agreements;
+    mapping(address => uint256) public userEscrowBalance;
+    mapping(address => string) public userKYCHash;
+    mapping(address => uint8[]) public contractorRatings;
+    mapping(address => string[]) public contractorSkills;
+    mapping(address => bool) public verifiedContractors;
+    mapping(uint256 => uint256) public pendingRentChanges;
+    mapping(uint256 => bool) public agreementLocked;
+    mapping(address => bool) public blacklistedUsers;
+    mapping(address => PaymentRecord[]) public userPayments;
 
-    // --- Bridge ---
-    function bridgeTransfer(uint256 a, string memory chain) external onlyKYCed notPaused nonReentrant {
-        require(a > 0 && balanceOf(msg.sender) >= a, "Invalid amount");
-        _burn(msg.sender, a);
-        emit BridgeTransfer(msg.sender, a, chain);
-    }
-    function setBridge(address b, bool ok) external onlyRole(GOVERNANCE_ROLE) { bridgeApproved[b] = ok; }
+    EmergencyMaintenance[] public emergencyRequests;
+    MaintenanceRequest[] public maintenanceRequests;
+    Dispute[] public disputes;
 
-    // --- Circuit Breaker ---
-    function toggleCircuitBreaker(bool s) external onlyRole(GOVERNANCE_ROLE) { circuitBreaker = s; emit CircuitBreakerTriggered(s); }
+    uint256 constant SECONDS_IN_MONTH = 30 days;
+    uint256 constant LATE_FEE_PERCENTAGE = 5;
+    uint256 constant MAX_LATE_FEE_MULTIPLIER = 10;
+    uint256 constant PLATFORM_FEE_PERCENTAGE = 2;
 
-    // --- Flash Loan ---
-    function flashLoan(address r, uint256 a, bytes calldata data) external nonReentrant notPaused {
-        require(r != address(0) && a > 0 && a <= balanceOf(address(this)), "Invalid loan");
-        uint256 fee = (a * flashLoanFeeBps) / 10_000;
-        uint256 repayment = a + fee;
-        _transfer(address(this), r, a);
-        IFlashLoanReceiver(r).executeOperation(a, fee, data);
-        require(balanceOf(address(this)) >= repayment, "Not repaid");
-        _transfer(r, address(this), repayment);
-        emit FlashLoan(r, a, fee);
+    modifier agreementExists(uint256 _agreementId) {
+        require(agreements[_agreementId].tenant != address(0), "Invalid agreement");
+        _;
     }
 
-    function setFlashLoanFeeBps(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
-        require(bps <= 1000, "Too high"); // max 10%
-        flashLoanFeeBps = bps;
-        emit FlashLoanFeeUpdated(bps);
+    modifier onlyTenant(uint256 _agreementId) {
+        require(msg.sender == agreements[_agreementId].tenant, "Not tenant");
+        _;
     }
 
-    // --- Governance ---
-    function createProposal(string memory d, address t, uint256 v, bytes memory data) external onlyRole(GOVERNANCE_ROLE) {
-        proposals[proposalCount] = Proposal(d, 0, block.timestamp, false, t, v, data);
-        emit ProposalCreated(proposalCount++, d);
-    }
-    function voteProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
-        Proposal storage p = proposals[id];
-        require(!p.executed && !hasVoted[id][msg.sender], "Invalid vote");
-        hasVoted[id][msg.sender] = true;
-        p.voteCount++;
-        emit Voted(id, msg.sender);
-    }
-    function executeProposal(uint256 id) external onlyRole(GOVERNANCE_ROLE) {
-        Proposal storage p = proposals[id];
-        require(!p.executed && block.timestamp >= p.createdAt + 3 days && p.voteCount >= proposalQuorum, "Cannot execute");
-        p.executed = true;
-        emit ProposalExecuted(id);
-        if (p.execTarget != address(0)) {
-            (bool ok, ) = p.execTarget.call{value: p.execValue}(p.execData);
-            require(ok, "Exec failed");
-        }
+    modifier onlyAgreementParties(uint256 _agreementId) {
+        Agreement memory a = agreements[_agreementId];
+        require(msg.sender == a.tenant || msg.sender == a.landlord, "Not party");
+        _;
     }
 
-    // --- Admin Config ---
-    function setOracle(address o) external onlyRole(GOVERNANCE_ROLE) { oracle = IOracle(o); }
-    function setRewardRate(uint256 r) external onlyRole(GOVERNANCE_ROLE) { rewardRate = r; }
-    function setFees(uint256 b, uint256 d) external onlyRole(GOVERNANCE_ROLE) { require(b <= 100 && d <= 100, "Too high"); burnPercent=b; devPercent=d; emit FeesUpdated(b,d); }
-    function setDevFund(address d) external onlyRole(GOVERNANCE_ROLE) { devFund = d; }
-    function setTreasury(address t) external onlyRole(GOVERNANCE_ROLE) { treasury = t; emit TreasuryUpdated(t); }
-    function withdrawFromTreasury(address token, uint256 a) external onlyRole(GOVERNANCE_ROLE) { require(token != address(this)); IERC20(token).safeTransfer(msg.sender, a); }
-    function slash(address u, uint256 a) external onlyRole(GOVERNANCE_ROLE) {
-        uint256 bal = balanceOf(u);
-        if (bal > 0) super._transfer(u, treasury, Math.min(bal, a));
-        emit Slashed(u, Math.min(bal, a));
-    }
-    function setManualOracle(uint256 p, bool e) external onlyRole(GOVERNANCE_ROLE) { manualPrice=p; useManualOracle=e; emit ManualOracleSet(p,e); }
-    function setTargetPrice(uint256 p) external onlyRole(GOVERNANCE_ROLE) { targetPrice=p; emit TargetPriceUpdated(p); }
-    function setRebaseThreshold(uint256 t) external onlyRole(GOVERNANCE_ROLE) { rebaseThreshold=t; emit RebaseThresholdUpdated(t); }
-    function setRebaseCooldown(uint256 c) external onlyRole(GOVERNANCE_ROLE) { rebaseCooldown=c; }
-    function setProposalQuorum(uint256 q) external onlyRole(GOVERNANCE_ROLE) { proposalQuorum=q; }
-
-    // --- New: Max Supply ---
-    function setMaxSupply(uint256 _max) external onlyRole(GOVERNANCE_ROLE) {
-        maxSupply = _max;
-        emit MaxSupplyUpdated(_max);
+    modifier notBlacklisted() {
+        require(!blacklistedUsers[msg.sender], "User blacklisted");
+        _;
     }
 
-    // --- New: Transfer limit (anti-whale) ---
-    // transferLimitBps is basis points of totalSupply allowed per txn (10000 == 100%)
-    function setTransferLimitBps(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
-        require(bps <= 10000, "bps>10000");
-        transferLimitBps = bps;
-        emit TransferLimitUpdated(bps);
-    }
-    function setTransferLimitExempt(address account, bool exempt) external onlyRole(GOVERNANCE_ROLE) {
-        transferLimitExempt[account] = exempt;
-        emit TransferLimitExemptToggled(account, exempt);
-    }
+    // ------------------- Events -------------------
+    event AgreementTerminated(uint256 agreementId, address by, uint256 time);
+    event AutoPaymentSetup(uint256 agreementId, address by, bool status);
+    event UserVerified(address user, uint256 score);
+    event ContractorVerified(address contractor, string[] skills);
+    event RentPaid(uint256 agreementId, address tenant, uint256 rent, uint256 lateFee, uint256 time);
+    event DocumentAccessRequested(uint256 indexed agreementId, address indexed requester, string documentType);
+    event AgreementRenewed(uint256 indexed agreementId, address renewedBy, uint256 newEndDate);
+    event AgreementRenewalRequested(uint256 agreementId, address requestedBy, uint256 requestedTill);
+    event AgreementRenewalRejected(uint256 agreementId, address rejectedBy);
+    event RentChangeProposed(uint256 indexed agreementId, address proposedBy, uint256 newRent);
+    event RentChangeAccepted(uint256 indexed agreementId, uint256 newRent);
+    event EmergencyMaintenanceRaised(uint256 requestId, uint256 agreementId, address tenant, string description);
+    event EmergencyMaintenanceResolved(uint256 requestId);
+    event ContractorRated(address contractor, uint8 rating);
+    event AgreementLocked(uint256 indexed agreementId, bool isLocked);
+    event EscrowWithdrawn(address user, uint256 amount);
+    event EmergencyPaused();
+    event EmergencyResumed();
+    event SecurityDepositAdded(uint256 agreementId, address landlord, uint256 amount);
+    event DisputeRaised(uint256 disputeId, uint256 agreementId, address by, string reason);
+    event DisputeResolved(uint256 disputeId, string resolutionNote);
+    event SecurityDepositRefunded(uint256 agreementId, address tenant, uint256 amount);
+    event UserBlacklisted(address user, bool status);
+    event PlatformFeesWithdrawn(address admin, uint256 amount);
+    event PartialRentPaid(uint256 agreementId, address tenant, uint256 amount);
 
-    // --- ERC20 Override (transfer tax + anti-whale via _beforeTokenTransfer) ---
-    function _transfer(address f, address t, uint256 a) internal override {
-        if (f == address(this) || t == address(this) || hasRole(GOVERNANCE_ROLE, f) || f == treasury) 
-            super._transfer(f, t, a);
-        else {
-            uint256 b = (a * burnPercent) / 100;
-            uint256 d = (a * devPercent) / 100;
-            if (b > 0) super._transfer(f, address(0), b);
-            if (d > 0) super._transfer(f, devFund, d);
-            super._transfer(f, t, a - b - d);
-        }
-    }
+    // ------------------- Core Functions -------------------
 
-    function _beforeTokenTransfer(address from, address to, uint256 amount) internal override {
-        super._beforeTokenTransfer(from, to, amount);
-
-        // if transferLimitBps == 0 -> disabled
-        if (transferLimitBps > 0 && from != address(0) && to != address(0)) {
-            if (!transferLimitExempt[from] && !transferLimitExempt[to]) {
-                uint256 maxAllowed = (totalSupply() * transferLimitBps) / 10000;
-                require(amount <= maxAllowed, "Transfer exceeds per-tx limit");
-            }
-        }
-
-        // circuit breaker
-        require(!circuitBreaker, "Transfers paused by circuit breaker");
-    }
-
-    // --- Recovery / Emergency functions ---
-    function emergencyWithdrawETH(address payable to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
-        require(amount <= address(this).balance, "Insufficient ETH");
-        to.transfer(amount);
-        emit EmergencyWithdrawn(to, amount);
-    }
-    function emergencyWithdrawERC20(address token, address to, uint256 amount) external onlyRole(GOVERNANCE_ROLE) {
-        IERC20(token).safeTransfer(to, amount);
-        emit EmergencyERC20Withdrawn(token, to, amount);
+    function acceptRentChange(uint256 _agreementId)
+        external nonReentrant whenNotPaused agreementExists(_agreementId) onlyTenant(_agreementId)
+    {
+        uint256 newRent = pendingRentChanges[_agreementId];
+        require(newRent > 0, "No proposed rent change");
+        agreements[_agreementId].monthlyRent = newRent;
+        delete pendingRentChanges[_agreementId];
+        emit RentChangeAccepted(_agreementId, newRent);
     }
 
-    function recoverTokens(address token) external onlyRole(GOVERNANCE_ROLE) {
-        require(token != address(this));
-        IERC20(token).safeTransfer(msg.sender, IERC20(token).balanceOf(address(this)));
+    function withdrawEscrow() external nonReentrant whenNotPaused {
+        require(userEscrowBalance[msg.sender] > 0, "No balance to withdraw");
+        require(!_hasActiveAgreement(msg.sender), "Active agreement exists");
+
+        uint256 balance = userEscrowBalance[msg.sender];
+        userEscrowBalance[msg.sender] = 0;
+        payable(msg.sender).transfer(balance);
+        emit EscrowWithdrawn(msg.sender, balance);
     }
 
-    function _getPrice() internal view returns (uint256) { return useManualOracle ? manualPrice : oracle.getPrice(); }
+    function depositSecurity(uint256 _agreementId) external payable whenNotPaused {
+        Agreement storage a = agreements[_agreementId];
+        require(msg.sender == a.landlord, "Only landlord");
+        require(msg.value > 0, "No deposit amount");
 
-    receive() external payable {}
-    fallback() external payable {}
+        a.securityDeposit += msg.value;
+        emit SecurityDepositAdded(_agreementId, msg.sender, msg.value);
+    }
+
+    function resolveEmergency(uint256 _requestId) external onlyAdmin {
+        EmergencyMaintenance storage request = emergencyRequests[_requestId];
+        require(!request.resolved, "Already resolved");
+        request.resolved = true;
+        emit EmergencyMaintenanceResolved(_requestId);
+    }
+
+    function emergencyPause() external onlyAdmin { _pause(); emit EmergencyPaused(); }
+    function resume() external onlyAdmin { _unpause(); emit EmergencyResumed(); }
+
+    // ------------------- New Functionalities -------------------
+
+    // ✅ Early Termination
+    function terminateAgreementEarly(uint256 _agreementId)
+        external nonReentrant whenNotPaused onlyTenant(_agreementId)
+    {
+        Agreement storage a = agreements[_agreementId];
+        require(a.isActive, "Agreement not active");
+
+        uint256 fee = a.earlyTerminationFee;
+        require(userEscrowBalance[msg.sender] >= fee, "Insufficient escrow");
+
+        userEscrowBalance[msg.sender] -= fee;
+        totalPlatformFees += fee;
+
+        a.isActive = false;
+        emit AgreementTerminated(_agreementId, msg.sender, block.timestamp);
+    }
+
+    // ✅ Partial Rent Payment
+    function payPartialRent(uint256 _agreementId) external payable whenNotPaused onlyTenant(_agreementId) {
+        require(msg.value > 0, "No payment");
+        Agreement storage a = agreements[_agreementId];
+        require(a.isActive, "Agreement not active");
+
+        a.totalRentPaid += msg.value;
+        userPayments[msg.sender].push(PaymentRecord(_agreementId, msg.value, block.timestamp));
+        emit PartialRentPaid(_agreementId, msg.sender, msg.value);
+    }
+
+    // ✅ Maintenance Funding
+    function fundMaintenance(uint256 _requestId) external payable {
+        MaintenanceRequest storage req = maintenanceRequests[_requestId];
+        require(msg.sender == agreements[req.agreementId].landlord, "Only landlord can fund");
+        require(!req.landlordFunded, "Already funded");
+        require(msg.value >= req.estimatedCost, "Insufficient funds");
+
+        req.landlordFunded = true;
+    }
+
+    // ✅ Security Deposit Refund
+    function refundSecurityDeposit(uint256 _agreementId) external onlyAdmin {
+        Agreement storage a = agreements[_agreementId];
+        require(!a.isActive, "Agreement still active");
+        require(a.securityDeposit > 0, "No deposit");
+
+        uint256 refund = a.securityDeposit;
+        a.securityDeposit = 0;
+        payable(a.tenant).transfer(refund);
+        emit SecurityDepositRefunded(_agreementId, a.tenant, refund);
+    }
+
+    // ✅ Blacklist Management
+    function blacklistUser(address _user, bool _status) external onlyAdmin {
+        blacklistedUsers[_user] = _status;
+        emit UserBlacklisted(_user, _status);
+    }
+
+    // ✅ Withdraw Platform Fees
+    function withdrawPlatformFees() external onlyAdmin {
+        uint256 amount = totalPlatformFees;
+        totalPlatformFees = 0;
+        payable(admin).transfer(amount);
+        emit PlatformFeesWithdrawn(admin, amount);
+    }
+
+    // ✅ Payment History
+    function getUserPaymentHistory(address _user) external view returns (PaymentRecord[] memory) {
+        return userPayments[_user];
+    }
+
+    // ✅ Agreement Renewal Request & Approval
+    function requestAgreementRenewal(uint256 _agreementId, uint256 _extendMonths)
+        external whenNotPaused onlyTenant(_agreementId)
+    {
+        Agreement storage a = agreements[_agreementId];
+        require(a.isActive, "Agreement not active");
+        require(_extendMonths > 0, "Invalid extension");
+
+        uint256 requestedTill = a.agreementEnd + (_extendMonths * SECONDS_IN_MONTH);
+        emit AgreementRenewalRequested(_agreementId, msg.sender, requestedTill);
+    }
+
+    function approveAgreementRenewal(uint256 _agreementId, uint256 _extendMonths)
+        external whenNotPaused onlyAgreementParties(_agreementId)
+    {
+        Agreement storage a = agreements[_agreementId];
+        require(a.isActive, "Agreement not active");
+        require(_extendMonths > 0, "Invalid extension");
+
+        a.agreementEnd += _extendMonths * SECONDS_IN_MONTH;
+        emit AgreementRenewed(_agreementId, msg.sender, a.agreementEnd);
+    }
+
+    function rejectAgreementRenewal(uint256 _agreementId)
+        external whenNotPaused onlyAgreementParties(_agreementId)
+    {
+        Agreement memory a = agreements[_agreementId];
+        require(a.isActive, "Agreement not active");
+        emit AgreementRenewalRejected(_agreementId, msg.sender);
+    }
+
+    // ✅ NEW FUNCTIONALITY: Dispute Resolution System
+    function raiseDispute(uint256 _agreementId, string calldata _reason)
+        external whenNotPaused onlyAgreementParties(_agreementId)
+    {
+        disputes.push(Dispute({
+            agreementId: _agreementId,
+            raisedBy: msg.sender,
+            reason: _reason,
+            resolved: false,
+            resolutionNote: ""
+        }));
+        emit DisputeRaised(disputes.length - 1, _agreementId, msg.sender, _reason);
+    }
+
+    function resolveDispute(uint256 _disputeId, string calldata _resolutionNote)
+        external onlyAdmin
+    {
+        Dispute storage d = disputes[_disputeId];
+        require(!d.resolved, "Dispute already resolved");
+
+        d.resolved = true;
+        d.resolutionNote = _resolutionNote;
+        emit DisputeResolved(_disputeId, _resolutionNote);
+    }
+
+    // ------------------- Internal Helpers -------------------
+    function _hasActiveAgreement(address _user) internal view returns (bool) {
+        for (uint i = 0; i < 100; i++)
+            if (agreements[i].tenant == _user && agreements[i].isActive) return true;
+        return false;
+    }
+
+    function _hasTenantWorkedWithContractor(address _tenant, address _contractor) internal view returns (bool) {
+        for (uint i = 0; i < maintenanceRequests.length; i++)
+            if (maintenanceRequests[i].assignedContractor == _contractor &&
+                agreements[maintenanceRequests[i].agreementId].tenant == _tenant) return true;
+        return false;
+    }
 }
 
