@@ -8,7 +8,9 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-interface IOracle { function getPrice() external view returns (uint256); }
+interface IOracle { 
+    function getPrice() external view returns (uint256); 
+}
 
 contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -61,6 +63,10 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     // Oracle
     IOracle public priceOracle;
 
+    // Buyback & Burn
+    IERC20 public reserveToken; // e.g. USDC/DAI held in treasury
+    address public treasury;    // where reserve tokens are stored
+
     // Events
     event ProposalCreated(uint256 indexed id, address indexed proposer, string description);
     event ProposalExecuted(uint256 indexed id);
@@ -69,18 +75,27 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event BlacklistUpdated(address account, bool status);
     event HalvingIntervalUpdated(uint256 newInterval);
     event RewardBoostEnded();
+    event BuybackAndBurn(uint256 reserveSpent, uint256 astcBurned);
 
-    constructor(address oracle) ERC20("Algorithmic Stablecoin", "ASTC") {
+    constructor(address oracle, address _reserveToken, address _treasury) 
+        ERC20("Algorithmic Stablecoin", "ASTC") 
+    {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(GOVERNANCE_ROLE, msg.sender);
         priceOracle = IOracle(oracle);
+        reserveToken = IERC20(_reserveToken);
+        treasury = _treasury;
     }
 
     // ------------------------ GOVERNANCE ------------------------
 
-    function createProposal(string memory desc, address target, uint256 value, bytes memory data) external onlyRole(GOVERNANCE_ROLE) {
+    function createProposal(string memory desc, address target, uint256 value, bytes memory data) 
+        external onlyRole(GOVERNANCE_ROLE) 
+    {
         proposalCount++;
-        proposals[proposalCount] = Proposal(proposalCount, msg.sender, desc, 0, false, block.timestamp, target, value, data);
+        proposals[proposalCount] = Proposal(
+            proposalCount, msg.sender, desc, 0, false, block.timestamp, target, value, data
+        );
         emit ProposalCreated(proposalCount, msg.sender, desc);
     }
 
@@ -156,13 +171,18 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
             uint256 halvingCount = elapsed / halvingInterval;
             if (halvingCount > 0) rewardRate = rewardRate >> halvingCount;
             uint256 r = elapsed * rewardRate;
-            if (block.timestamp <= rewardBoostEnd) r = (r * rewardBoostMultiplier) / 1e18;
-            else if (rewardBoostMultiplier > 1e18) { rewardBoostMultiplier = 1e18; emit RewardBoostEnded(); }
+            if (block.timestamp <= rewardBoostEnd) {
+                r = (r * rewardBoostMultiplier) / 1e18;
+            } else if (rewardBoostMultiplier > 1e18) { 
+                rewardBoostMultiplier = 1e18; 
+                emit RewardBoostEnded(); 
+            }
             accRewardPerToken += (r * 1e18) / totalStaked();
             lastRewardTime = block.timestamp;
         }
         uint256 earned = ((stakes[u].amount * accRewardPerToken) / 1e18) - stakes[u].rewardDebt;
-        stakes[u].rewardDebt += earned; stakes[u].lastClaimed = block.timestamp;
+        stakes[u].rewardDebt += earned; 
+        stakes[u].lastClaimed = block.timestamp;
     }
 
     function totalStaked() public view returns (uint256) {
@@ -180,8 +200,30 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     function _beforeTokenTransfer(address f, address t, uint256 a) internal override {
         require(!blacklisted[f] && !blacklisted[t], "Blacklisted");
         require(!circuitBreaker, "Paused");
-        if (transferLimitBps > 0 && f != address(0) && t != address(0) && !transferLimitExempt[f] && !transferLimitExempt[t])
+        if (
+            transferLimitBps > 0 && 
+            f != address(0) && 
+            t != address(0) && 
+            !transferLimitExempt[f] && 
+            !transferLimitExempt[t]
+        ) {
             require(a <= (totalSupply() * transferLimitBps) / 1e4, "Limit exceeded");
+        }
         super._beforeTokenTransfer(f, t, a);
     }
+
+    // ------------------------ BUYBACK & BURN ------------------------
+
+    function buybackAndBurn(uint256 reserveAmount, uint256 astcAmount) 
+        external onlyRole(GOVERNANCE_ROLE) nonReentrant 
+    {
+        require(reserveAmount > 0 && astcAmount > 0, "Invalid amounts");
+        reserveToken.safeTransferFrom(treasury, address(this), reserveAmount);
+
+        // Burn ASTC directly from treasury reserves or DAO holdings
+        _burn(address(this), astcAmount);
+
+        emit BuybackAndBurn(reserveAmount, astcAmount);
+    }
 }
+
