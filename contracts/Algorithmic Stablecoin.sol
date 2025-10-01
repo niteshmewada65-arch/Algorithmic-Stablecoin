@@ -67,6 +67,10 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     IERC20 public reserveToken; // e.g. USDC/DAI held in treasury
     address public treasury;    // where reserve tokens are stored
 
+    // ------------------------ DYNAMIC FEES ------------------------
+    uint256 public transferFeeBps; // e.g., 50 = 0.5%
+    uint256 public constant MAX_FEE_BPS = 500; // 5% max
+
     // Events
     event ProposalCreated(uint256 indexed id, address indexed proposer, string description);
     event ProposalExecuted(uint256 indexed id);
@@ -76,6 +80,8 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
     event HalvingIntervalUpdated(uint256 newInterval);
     event RewardBoostEnded();
     event BuybackAndBurn(uint256 reserveSpent, uint256 astcBurned);
+    event TransferFeeUpdated(uint256 newFee);
+    event FeeCollected(address indexed from, address indexed to, uint256 feeAmount);
 
     constructor(address oracle, address _reserveToken, address _treasury) 
         ERC20("Algorithmic Stablecoin", "ASTC") 
@@ -210,6 +216,28 @@ contract AlgorithmicStablecoin is ERC20, AccessControl, ReentrancyGuard {
             require(a <= (totalSupply() * transferLimitBps) / 1e4, "Limit exceeded");
         }
         super._beforeTokenTransfer(f, t, a);
+    }
+
+    // ------------------------ DYNAMIC FEES ------------------------
+
+    function setTransferFee(uint256 bps) external onlyRole(GOVERNANCE_ROLE) {
+        require(bps <= MAX_FEE_BPS, "Fee too high");
+        transferFeeBps = bps;
+        emit TransferFeeUpdated(bps);
+    }
+
+    function _transfer(address sender, address recipient, uint256 amount) internal override {
+        if (transferFeeBps > 0 && !transferLimitExempt[sender] && !transferLimitExempt[recipient]) {
+            uint256 fee = (amount * transferFeeBps) / 10000;
+            uint256 sendAmount = amount - fee;
+
+            super._transfer(sender, treasury, fee);       // Send fee to treasury
+            super._transfer(sender, recipient, sendAmount);
+
+            emit FeeCollected(sender, recipient, fee);
+        } else {
+            super._transfer(sender, recipient, amount);
+        }
     }
 
     // ------------------------ BUYBACK & BURN ------------------------
